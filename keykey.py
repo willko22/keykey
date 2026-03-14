@@ -7,25 +7,46 @@ Auto-detects keyboard layout (QWERTY/QWERTZ/AZERTY/Dvorak/Colemak).
 import json, sys, threading, platform, math, os, time, ctypes
 from collections import Counter
 from pathlib import Path
+from pynput import keyboard as pynput_kb
+import tkinter as tk
+from tkinter import ttk
 
-try:
-    from pynput import keyboard as pynput_kb
-except ImportError:
-    print("Missing: pip install pynput"); sys.exit(1)
-try:
-    import tkinter as tk
-    from tkinter import ttk
-except ImportError:
-    print("Tkinter not found."); sys.exit(1)
 HAS_TRAY = platform.system() == "Windows"
 TRAY_IMPORT_ERROR = None if HAS_TRAY else "Native tray is only supported on Windows"
 
 # ── storage ───────────────────────────────────────────────────────────────────
-BASE_DIR   = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 SAVE_FILE  = BASE_DIR / "stats.json"
 PREFS_FILE = Path.home() / ".key_heatmap_prefs.json"
 ICON_FILE  = BASE_DIR / "keykey.ico"
 APP_ALL_ID = "__all__"
+UNATTRIBUTED_APP_ID = "__unattributed__"
+DOTA2_APP_ID = "__dota2__"
+WINDOW_TITLE_PREFIX = "window::"
+
+def _foreground_window_title_windows(hwnd):
+    user32 = ctypes.windll.user32
+    title_len = user32.GetWindowTextLengthW(hwnd)
+    if title_len <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(title_len + 1)
+    user32.GetWindowTextW(hwnd, buf, title_len + 1)
+    return buf.value or ""
+
+def _infer_game_app_id_from_title(title):
+    t = (title or "").lower()
+    if "dota" in t and "2" in t:
+        return DOTA2_APP_ID
+    return None
+
+def _window_title_app_id(title):
+    clean = (title or "").strip()
+    if not clean:
+        return None
+    return f"{WINDOW_TITLE_PREFIX}{clean}"
 
 def load_stats():
     if not SAVE_FILE.exists():
@@ -58,7 +79,8 @@ counts_by_app  = load_stats()
 current_app_id = None
 last_active_app_id = None
 counts_lock    = threading.Lock()
-save_tick      = 0
+held_keys      = set()
+stats_dirty    = False
 
 def _foreground_app_path_windows():
     user32 = ctypes.windll.user32
@@ -69,6 +91,8 @@ def _foreground_app_path_windows():
     if not hwnd:
         return None
 
+    title = _foreground_window_title_windows(hwnd)
+
     pid = ctypes.c_ulong()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     if not pid.value or pid.value == os.getpid():
@@ -77,15 +101,38 @@ def _foreground_app_path_windows():
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
     if not hproc:
-        return None
+        # If process details are blocked, attribute by exact window title.
+        inferred = _infer_game_app_id_from_title(title)
+        if inferred:
+            return inferred
+        return _window_title_app_id(title)
     try:
         buf_len = ctypes.c_ulong(1024)
         buf = ctypes.create_unicode_buffer(buf_len.value)
         if not psapi.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(buf_len)):
-            return None
+            inferred = _infer_game_app_id_from_title(title)
+            if inferred:
+                return inferred
+            return _window_title_app_id(title)
         return str(Path(buf.value))
     finally:
         kernel32.CloseHandle(hproc)
+
+def _display_app_label(app_id):
+    if not app_id:
+        return None
+    if app_id == DOTA2_APP_ID:
+        return "Dota 2"
+    if app_id.startswith(WINDOW_TITLE_PREFIX):
+        return app_id[len(WINDOW_TITLE_PREFIX):]
+    if app_id == UNATTRIBUTED_APP_ID:
+        return "Unknown / Unattributed"
+    if app_id.startswith("process_"):
+        return app_id.replace("process_", "PID ") + " (restricted)"
+    p = Path(app_id)
+    if p.suffix.lower() == ".exe":
+        return p.stem
+    return p.name or app_id
 
 def get_foreground_app_id():
     if platform.system() != "Windows":
@@ -214,23 +261,40 @@ def normalise_key(key):
         return None
 
 def on_press(key):
-    global save_tick
+    global stats_dirty
     k = normalise_key(key)
     if not k:
         return
 
     with counts_lock:
+        if k in held_keys:
+            return
+        held_keys.add(k)
+
+        # If foreground app cannot be identified by EXE or window title, ignore.
         app_id = current_app_id
         if not app_id:
             return
         app_counts = counts_by_app.setdefault(app_id, Counter())
         app_counts[k] += 1
-        save_tick += 1
-        if save_tick >= 100:
-            save_tick = 0
-            save_stats(counts_by_app)
+        stats_dirty = True
 
-listener = pynput_kb.Listener(on_press=on_press)
+def on_release(key):
+    k = normalise_key(key)
+    if not k:
+        return
+    with counts_lock:
+        held_keys.discard(k)
+
+def flush_stats_if_dirty():
+    global stats_dirty
+    with counts_lock:
+        if not stats_dirty:
+            return
+        save_stats(counts_by_app)
+        stats_dirty = False
+
+listener = pynput_kb.Listener(on_press=on_press, on_release=on_release)
 listener.daemon = True
 listener.start()
 
@@ -410,18 +474,18 @@ def merge_all_counts(all_counts):
     return merged
 
 def make_app_labels(app_ids):
-    paths = [Path(p) for p in app_ids]
     base_names = []
-    for p in paths:
-        base_names.append(p.stem if p.suffix.lower() == ".exe" else p.name)
+    for app_id in app_ids:
+        base_names.append(_display_app_label(app_id))
 
     name_freq = Counter(base_names)
     out = {}
     used = set()
-    for app_id, p, base in zip(app_ids, paths, base_names):
+    for app_id, base in zip(app_ids, base_names):
         if name_freq[base] <= 1:
             label = base
         else:
+            p = Path(app_id)
             folder = p.parent.name or str(p.parent)
             label = f"{base} << {folder}"
 
@@ -801,7 +865,7 @@ class HeatmapWindow:
             scope = self.view_var.get()
         active_label = ""
         if active:
-            active_name = Path(active).stem if Path(active).suffix.lower() == ".exe" else Path(active).name
+            active_name = _display_app_label(active)
             active_label = f"  |  active: {active_name}"
         self.total_lbl.config(text=f"{total:,} keystrokes  |  {scope}{active_label}")
         self._update_bars(snap,total)
@@ -846,6 +910,7 @@ class HeatmapWindow:
         self._draw_bars_indicators()
 
     def _auto_refresh(self):
+        flush_stats_if_dirty()
         self._refresh()
         self.root.after(2000,self._auto_refresh)
 
@@ -885,15 +950,18 @@ class HeatmapWindow:
                 return
             with counts_lock:
                 counts_by_app.clear()
-                save_stats(counts_by_app)
+                global stats_dirty
+                stats_dirty = True
         else:
             ok = tkinter.messagebox.askyesno("Reset", f"Clear keystroke data for '{selected_label}'?")
             if not ok:
                 return
             with counts_lock:
                 counts_by_app.pop(selected_id, None)
-                save_stats(counts_by_app)
+                global stats_dirty
+                stats_dirty = True
 
+        flush_stats_if_dirty()
         self._sync_app_selector()
         self._draw_keys()
         self._refresh()
@@ -908,7 +976,7 @@ class HeatmapWindow:
         if self._tray_mode:
             self.hide()
         else:
-            save_stats(counts_by_app)
+            flush_stats_if_dirty()
             self.root.destroy()
 
     def show(self):
@@ -916,7 +984,7 @@ class HeatmapWindow:
     def hide(self):
         self._save_geometry(); self.root.withdraw()
     def run(self):
-        self.root.mainloop(); save_stats(counts_by_app)
+        self.root.mainloop(); flush_stats_if_dirty()
 
 # ── tray (native Windows) ─────────────────────────────────────────────────────
 if platform.system() == "Windows":
