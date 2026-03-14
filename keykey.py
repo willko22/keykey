@@ -940,6 +940,7 @@ class HeatmapWindow:
             self.canvas.itemconfig(cell["texts"][1], text=cell["shift"])
 
     def _reset(self):
+        global stats_dirty
         import tkinter.messagebox
         selected_label = self.view_var.get()
         selected_id = self.view_map.get(selected_label, APP_ALL_ID)
@@ -950,7 +951,6 @@ class HeatmapWindow:
                 return
             with counts_lock:
                 counts_by_app.clear()
-                global stats_dirty
                 stats_dirty = True
         else:
             ok = tkinter.messagebox.askyesno("Reset", f"Clear keystroke data for '{selected_label}'?")
@@ -958,7 +958,6 @@ class HeatmapWindow:
                 return
             with counts_lock:
                 counts_by_app.pop(selected_id, None)
-                global stats_dirty
                 stats_dirty = True
 
         flush_stats_if_dirty()
