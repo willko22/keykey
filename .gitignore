@@ -5,3 +5,4 @@ dist/
 keykey.spec
 stats.json
 *.zip
+prefs.json

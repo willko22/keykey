@@ -2,10 +2,12 @@ MAIN_VERSION = 2
 FEATURE_VERSION = 4
 FIXES_VERSION = 0
 
-# TODO:
-# - Add Russian and Ukrainian keyboard layout support.
-# - Map Cyrillic VK codes to stable key_ids (same approach as Latin keys).
-# - Render the correct Cyrillic labels on the heatmap.
+# TODO/FIX:
+# - russian and ukrainian detected keys only on second time.
+# - stats should also show russian/ukrainian when the layout is chosen 
+# - each character needs to be remembered in its for... and shown only when that layout is used... so russian dont show on english and wise versa.
+# - when app is added we need to immediatelly check it and add it to prefs as checked.
+# while having only few colors, the collors are off.  there is no darkest color. we always need darkest blue and brightest red. when we have some middle we add green and after that we correctly add inbetweens...
 
 """
 Key Heatmap – tracks keystrokes with heatmap visualization.
@@ -33,7 +35,7 @@ else:
 SAVE_FILE  = BASE_DIR / "stats.json"
 PREFS_FILE = BASE_DIR / "prefs.json"
 LEGACY_PREFS_FILE = Path.home() / ".key_heatmap_prefs.json"
-CONFIG_FILE = BASE_DIR / "keykey.toml"
+CONFIG_FILE = BASE_DIR / "config.toml"
 ICON_FILE  = BASE_DIR / "keykey.ico"
 APP_ALL_ID = "__all__"
 UNATTRIBUTED_APP_ID = "__unattributed__"
@@ -252,55 +254,15 @@ def _build_color_ratio_fn(snap, color_cfg):
     if not ordered_values:
         return lambda v: 0.0
 
-    devider = max(0.0001, _to_float(color_cfg.get("devider", 2.0), 2.0))
-    threshold = min(100.0, max(0.0, _to_float(color_cfg.get("threshold", 15.0), 15.0)))
-
-    group_by_value = {}
-    group_values = [[ordered_values[0]]]
-    current_group = 0
-    group_min = float(ordered_values[0])
-    p = threshold
-
-    group_by_value[ordered_values[0]] = 0
-    for value in ordered_values[1:]:
-        v = float(value)
-        scaled_v = v / devider
-        diff_pct = abs(scaled_v - group_min) / max(1e-9, group_min) * 100.0
-        if diff_pct >= p:
-            current_group += 1
-            group_min = v
-            group_values.append([])
-        group_by_value[value] = current_group
-        group_values[current_group].append(value)
-
-    group_count = len(group_values)
-    ratio_by_value = {}
-    if group_count == 1:
-        values = group_values[0]
-        n = len(values)
-        if n <= 1:
-            ratio_by_value[values[0]] = 1.0
-        else:
-            # Single category: preserve gradient from low to high.
-            for i, value in enumerate(values):
-                ratio_by_value[value] = i / (n - 1)
+    n = len(ordered_values)
+    if n == 1:
+        ratio_by_value = {ordered_values[0]: 1.0}
     else:
-        # Group anchors map evenly from blue (0) to red (1).
-        # Example for 7 groups: 0, 1/6, 2/6, 3/6, 4/6, 5/6, 1.
-        denom = group_count - 1
-        for gi, values in enumerate(group_values):
-            n = len(values)
-            g_lo = gi / denom
-            if n <= 1:
-                ratio_by_value[values[0]] = g_lo
-                continue
-            if gi < denom:
-                g_hi = (gi + 1) / denom
-            else:
-                g_hi = 1.0
-            for i, value in enumerate(values):
-                within = i / (n - 1)
-                ratio_by_value[value] = g_lo + within * (g_hi - g_lo)
+        # Keep the smallest non-zero value near empty while preserving full red at max.
+        # Example with 3 distinct values => 0.02 / 0.51 / 1.00.
+        lo = 0.02
+        span = 1.0 - lo
+        ratio_by_value = {val: lo + (i / (n - 1)) * span for i, val in enumerate(ordered_values)}
 
     def ratio_fn(v):
         vv = int(max(0.0, float(v)))
@@ -308,9 +270,8 @@ def _build_color_ratio_fn(snap, color_cfg):
             return 0.0
         pos = bisect.bisect_right(ordered_values, vv) - 1
         if pos < 0:
-            return max(0.0, min(1.0, ratio_by_value[ordered_values[0]]))
-        mapped = ordered_values[pos]
-        return max(0.0, min(1.0, ratio_by_value[mapped]))
+            return 0.0
+        return ratio_by_value[ordered_values[pos]]
 
     return ratio_fn
 
@@ -494,18 +455,58 @@ def load_stats():
         return {}
     with open(SAVE_FILE, encoding="utf-8") as f:
         raw = json.load(f)
-    # Backward compatibility: if stats are in a flat key->count shape,
-    # treat it as an all-app aggregate bucket.
-    if raw and all(isinstance(v, int) for v in raw.values()):
-        return {APP_ALL_ID: Counter(raw)}
+
+    def _to_counter(payload):
+        if not isinstance(payload, dict):
+            return Counter()
+        out_counter = Counter()
+        for key_id, count in payload.items():
+            try:
+                out_counter[str(key_id)] = int(count)
+            except Exception:
+                continue
+        return out_counter
+
+    # Legacy flat format: {"a": 12, ...} -> all-app qwerty bucket.
+    if isinstance(raw, dict) and raw and all(isinstance(v, int) for v in raw.values()):
+        return {APP_ALL_ID: {"qwerty": _to_counter(raw)}}
+
     out = {}
-    for app_id, app_counts in raw.items():
-        if isinstance(app_counts, dict):
-            out[app_id] = Counter({k: int(v) for k, v in app_counts.items()})
+    if not isinstance(raw, dict):
+        return out
+
+    for app_id, app_payload in raw.items():
+        if not isinstance(app_payload, dict):
+            continue
+
+        # Legacy per-app flat format: {app: {"a": 12, ...}}
+        if app_payload and all(isinstance(v, int) for v in app_payload.values()):
+            out[str(app_id)] = {"qwerty": _to_counter(app_payload)}
+            continue
+
+        layout_map = {}
+        for layout_name, layout_counts in app_payload.items():
+            counter = _to_counter(layout_counts)
+            if counter:
+                layout_map[str(layout_name)] = counter
+
+        if layout_map:
+            out[str(app_id)] = layout_map
+
     return out
 
 def save_stats(all_counts):
-    payload = {app_id: dict(counter) for app_id, counter in all_counts.items()}
+    payload = {}
+    for app_id, layout_map in all_counts.items():
+        if not isinstance(layout_map, dict):
+            continue
+        serialized_layouts = {}
+        for layout_name, counter in layout_map.items():
+            if isinstance(counter, Counter) and counter:
+                serialized_layouts[str(layout_name)] = dict(counter)
+        if serialized_layouts:
+            payload[str(app_id)] = serialized_layouts
+
     with open(SAVE_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
@@ -539,6 +540,12 @@ last_active_app_id = None
 counts_lock    = threading.Lock()
 held_keys      = set()
 stats_dirty    = False
+layout_state_lock = threading.Lock()
+layout_change_callbacks = []
+last_detected_layout = None
+layout_probe_lock = threading.Lock()
+last_layout_probe_at = 0.0
+LAYOUT_PROBE_INTERVAL = 0.12
 
 def _foreground_app_path_windows():
     user32 = ctypes.windll.user32
@@ -610,6 +617,7 @@ def _focus_watcher():
             current_app_id = app_id
             if app_id:
                 last_active_app_id = app_id
+        _maybe_refresh_detected_layout(force=True)
         time.sleep(0.2)
 
 # ── key normalisation ─────────────────────────────────────────────────────────
@@ -699,19 +707,7 @@ def _key_category(kid):
     return "special"       # multi-char = named key (shift, return, ctrl, …)
 
 def normalise_key(key):
-    # 1. Try VK code first (most reliable on Windows for symbol keys)
-    vk = getattr(key, "vk", None)
-    if vk is not None:
-        if vk in _VK_TO_ID:
-            return _VK_TO_ID[vk]
-        # digit keys: vk 48-57
-        if 48 <= vk <= 57:
-            return str(vk - 48) if vk > 48 else "0"
-        # alpha keys: vk 65-90
-        if 65 <= vk <= 90:
-            return chr(vk + 32)  # lowercase
-
-    # 2. Try key.char for anything with a printable character
+    # 1. Prefer key.char so non-Latin layouts (RU/UA/etc.) keep their own keys.
     try:
         ch = key.char
         if ch and len(ch) == 1:
@@ -722,16 +718,42 @@ def normalise_key(key):
     except AttributeError:
         pass
 
-    # 3. Special keys by name
+    # 2. Fall back to VK code for non-printable keys and reliable control keys.
+    vk = getattr(key, "vk", None)
+    if vk is not None:
+        if vk in _VK_TO_ID:
+            return _VK_TO_ID[vk]
+        if 48 <= vk <= 57:
+            return str(vk - 48) if vk > 48 else "0"
+        if 65 <= vk <= 90:
+            return chr(vk + 32)
+
+    # 3. Special keys by name.
     try:
         raw = str(key).replace("Key.", "").lower()
         return _SPECIAL_TO_ID.get(raw, raw)
     except Exception:
         return None
 
+def _layout_adjust_key_id(layout_name, key_id):
+    if not key_id:
+        return key_id
+    if layout_name in ("ru_jcuken", "ua_jcuken"):
+        # Global shifted-symbol normalization is Latin-centric. Fix key ids for
+        # RU/UA so shifted punctuation still lands on the correct Cyrillic rows.
+        return {
+            "'": "2",
+            ";": "6",
+            "/": "7",
+            ",": ".",
+        }.get(key_id, key_id)
+    return key_id
+
 def on_press(key):
     global stats_dirty
+    layout_name = _maybe_refresh_detected_layout() or "qwerty"
     k = normalise_key(key)
+    k = _layout_adjust_key_id(layout_name, k)
     if not k:
         return
 
@@ -744,8 +766,9 @@ def on_press(key):
         app_id = current_app_id
         if not app_id or _is_excluded_app(app_id, _RUNTIME_APPS_CFG):
             return
-        app_counts = counts_by_app.setdefault(app_id, Counter())
-        app_counts[k] += 1
+        app_layouts = counts_by_app.setdefault(app_id, {})
+        layout_counts = app_layouts.setdefault(layout_name, Counter())
+        layout_counts[k] += 1
         stats_dirty = True
 
 def on_release(key):
@@ -763,52 +786,156 @@ def flush_stats_if_dirty():
         save_stats(counts_by_app)
         stats_dirty = False
 
-listener = pynput_kb.Listener(on_press=on_press, on_release=on_release)
-listener.daemon = True
-listener.start()
-
-_set_runtime_apps_cfg(_load_config()["apps"])
-
-if platform.system() == "Windows":
-    focus_thread = threading.Thread(target=_focus_watcher, daemon=True)
-    focus_thread.start()
-
 # ── layout detection ──────────────────────────────────────────────────────────
-_LANG_TO_LAYOUT = {
-    0x0409:"qwerty", 0x0809:"qwerty", 0x0c09:"qwerty", 0x1009:"qwerty",
-    0x0407:"qwertz", 0x0807:"qwertz", 0x0c07:"qwertz",
-    0x041b:"qwertz", 0x0405:"qwertz", 0x040e:"qwertz",
-    0x040c:"azerty", 0x080c:"azerty", 0x100c:"azerty",
-    0x0419:"ru_jcuken", 0x0819:"ru_jcuken", 0x2019:"ru_jcuken",
-    0x0422:"ua_jcuken", 0x0822:"ua_jcuken",
+_WINDOWS_ALPHA_SCANCODES = {
+    "q": 0x10, "w": 0x11, "e": 0x12, "r": 0x13, "t": 0x14,
+    "y": 0x15, "u": 0x16, "i": 0x17, "o": 0x18, "p": 0x19,
+    "a": 0x1E, "s": 0x1F, "d": 0x20, "f": 0x21, "g": 0x22,
+    "h": 0x23, "j": 0x24, "k": 0x25, "l": 0x26,
+    "z": 0x2C, "x": 0x2D, "c": 0x2E, "v": 0x2F, "b": 0x30,
+    "n": 0x31, "m": 0x32,
 }
+
+_LAYOUT_SIGNATURE_POSITIONS = {
+    "q": (1, 1), "w": (1, 2), "e": (1, 3), "r": (1, 4), "t": (1, 5),
+    "y": (1, 6), "u": (1, 7), "i": (1, 8), "o": (1, 9), "p": (1, 10),
+    "a": (2, 1), "s": (2, 2), "d": (2, 3), "f": (2, 4), "g": (2, 5),
+    "h": (2, 6), "j": (2, 7), "k": (2, 8), "l": (2, 9),
+    "z": (3, 1), "x": (3, 2), "c": (3, 3), "v": (3, 4), "b": (3, 5),
+    "n": (3, 6), "m": (3, 7),
+}
+
+def _windows_layout_handle():
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    thread_id = user32.GetWindowThreadProcessId(hwnd, 0) if hwnd else 0
+    return user32.GetKeyboardLayout(thread_id)
+
+def _windows_probe_char(scan_code, hkl):
+    user32 = ctypes.windll.user32
+    MAPVK_VSC_TO_VK_EX = 3
+    vk = user32.MapVirtualKeyExW(scan_code, MAPVK_VSC_TO_VK_EX, hkl)
+    if not vk:
+        return ""
+
+    key_state = (ctypes.c_ubyte * 256)()
+    buffer = ctypes.create_unicode_buffer(8)
+    result = user32.ToUnicodeEx(vk, scan_code, key_state, buffer, len(buffer), 0, hkl)
+
+    if result < 0:
+        while user32.ToUnicodeEx(vk, scan_code, key_state, buffer, len(buffer), 0, hkl) < 0:
+            pass
+        return ""
+    if result <= 0:
+        return ""
+    return buffer.value[:result].lower()
+
+def _windows_layout_signature(hkl):
+    signature = {}
+    for key_id, scan_code in _WINDOWS_ALPHA_SCANCODES.items():
+        ch = _windows_probe_char(scan_code, hkl)
+        if ch:
+            signature[key_id] = ch
+    return signature
+
+def _layout_signature(layout_name):
+    rows = LAYOUTS.get(layout_name, [])
+    signature = {}
+    for key_id, (row_idx, col_idx) in _LAYOUT_SIGNATURE_POSITIONS.items():
+        try:
+            signature[key_id] = str(rows[row_idx][col_idx][0]).lower()
+        except Exception:
+            pass
+    return signature
+
+def _detect_windows_layout_name():
+    hkl = _windows_layout_handle()
+    if not hkl:
+        return "qwerty"
+
+    active_signature = _windows_layout_signature(hkl)
+    best_name = "qwerty"
+    best_score = -1
+    for layout_name, expected_signature in _WINDOWS_LAYOUT_SIGNATURES.items():
+        score = 0
+        for key_id, expected_char in expected_signature.items():
+            if active_signature.get(key_id) == expected_char:
+                score += 1
+        if score > best_score:
+            best_name = layout_name
+            best_score = score
+    return best_name
 
 def detect_layout():
     if platform.system() == "Windows":
         try:
-            import ctypes
-            u = ctypes.WinDLL("user32", use_last_error=True)
-            hkl  = u.GetKeyboardLayout(u.GetWindowThreadProcessId(u.GetForegroundWindow(), 0))
-            lang = hkl & 0xFFFF
-            name = _LANG_TO_LAYOUT.get(lang)
-            if name: return name
-            p = lang & 0xFF
-            if p == 0x07: return "qwertz"
-            if p == 0x0c: return "azerty"
-        except Exception: pass
+            return _detect_windows_layout_name()
+        except Exception:
+            pass
     try:
-        import subprocess
-        out = subprocess.check_output(["localectl","status"],text=True,stderr=subprocess.DEVNULL)
-        for line in out.splitlines():
-            v = line.split(":")[-1].strip().lower()
-            if "dvorak"  in v: return "dvorak"
-            if "colemak" in v: return "colemak"
-            if v.startswith("ru"): return "ru_jcuken"
-            if v.startswith("uk") or v.startswith("ua"): return "ua_jcuken"
-            if any(v.startswith(x) for x in ("de","sk","cz","hu")): return "qwertz"
-            if any(v.startswith(x) for x in ("fr","be")):           return "azerty"
-    except Exception: pass
+        out = subprocess.check_output(["localectl", "status"], text=True, stderr=subprocess.DEVNULL)
+        text = out.lower()
+        if "dvorak" in text:
+            return "dvorak"
+        if "colemak" in text:
+            return "colemak"
+        if any(token in text for token in ("fr", "be", "azerty")):
+            return "azerty"
+        if "qwertz" in text:
+            return "qwertz"
+        if any(token in text for token in ("ru", "jcuken")):
+            return "ru_jcuken"
+        if any(token in text for token in ("ua", "uk", "йцукен")):
+            return "ua_jcuken"
+    except Exception:
+        pass
     return "qwerty"
+
+def register_layout_change_callback(callback):
+    with layout_state_lock:
+        if callback not in layout_change_callbacks:
+            layout_change_callbacks.append(callback)
+
+def refresh_detected_layout():
+    global last_detected_layout
+
+    layout_name = detect_layout()
+    callbacks = []
+    with layout_state_lock:
+        if layout_name == last_detected_layout:
+            return layout_name
+        last_detected_layout = layout_name
+        callbacks = list(layout_change_callbacks)
+
+    for callback in callbacks:
+        try:
+            callback(layout_name)
+        except Exception:
+            pass
+    return layout_name
+
+def _maybe_refresh_detected_layout(force=False):
+    global last_layout_probe_at
+
+    if platform.system() != "Windows":
+        if force or last_detected_layout is None:
+            return refresh_detected_layout()
+        return last_detected_layout
+
+    should_refresh = force or last_detected_layout is None
+    if not should_refresh:
+        now = time.monotonic()
+        with layout_probe_lock:
+            if now - last_layout_probe_at >= LAYOUT_PROBE_INTERVAL:
+                last_layout_probe_at = now
+                should_refresh = True
+
+    if should_refresh:
+        return refresh_detected_layout()
+    return last_detected_layout
+
+listener = pynput_kb.Listener(on_press=on_press, on_release=on_release)
+listener.daemon = True
 
 # ── layout definitions ────────────────────────────────────────────────────────
 # Tuple: (normal_label, shifted_label, key_id, width)
@@ -873,34 +1000,34 @@ LAYOUTS = {
      sk("AltGr","alt_r",1.25),sk("Win","cmd_r",1.25),sk("Menu","menu",1.25),sk("Ctrl","ctrl_r",1.25)],
 ],
 "ru_jcuken": [
-    [pk("ё","Ё","`"),pk("1","!","1"),pk("2",'"',"2"),pk("3","№","3"),pk("4",";","4"),pk("5","%","5"),
+    [pk("ё","Ё","ё"),pk("1","!","1"),pk("2",'"',"2"),pk("3","№","3"),pk("4",";","4"),pk("5","%","5"),
      pk("6",":","6"),pk("7","?","7"),pk("8","*","8"),pk("9","(","9"),pk("0",")","0"),
      pk("-","_","-"),pk("=","+","="),sk("Bksp","backspace",2)],
-    [sk("Tab","tab",1.5),pk("й","Й","q"),pk("ц","Ц","w"),pk("у","У","e"),pk("к","К","r"),
-     pk("е","Е","t"),pk("н","Н","y"),pk("г","Г","u"),pk("ш","Ш","i"),pk("щ","Щ","o"),pk("з","З","p"),
-     pk("х","Х","["),pk("ъ","Ъ","]"),pk("\\","/",None,1.5)],
-    [sk("Caps","caps_lock",1.75),pk("ф","Ф","a"),pk("ы","Ы","s"),pk("в","В","d"),pk("а","А","f"),
-     pk("п","П","g"),pk("р","Р","h"),pk("о","О","j"),pk("л","Л","k"),pk("д","Д","l"),
-     pk("ж","Ж",";"),pk("э","Э","'"),sk("Enter","return",2.25)],
-    [sk("Shift","shift",2.25),pk("я","Я","z"),pk("ч","Ч","x"),pk("с","С","c"),pk("м","М","v"),
-     pk("и","И","b"),pk("т","Т","n"),pk("ь","Ь","m"),pk("б","Б",","),pk("ю","Ю","."),(  ".",",","/",1),
+    [sk("Tab","tab",1.5),pk("й","Й","й"),pk("ц","Ц","ц"),pk("у","У","у"),pk("к","К","к"),
+     pk("е","Е","е"),pk("н","Н","н"),pk("г","Г","г"),pk("ш","Ш","ш"),pk("щ","Щ","щ"),pk("з","З","з"),
+     pk("х","Х","х"),pk("ъ","Ъ","ъ"),pk("\\","/",None,1.5)],
+    [sk("Caps","caps_lock",1.75),pk("ф","Ф","ф"),pk("ы","Ы","ы"),pk("в","В","в"),pk("а","А","а"),
+     pk("п","П","п"),pk("р","Р","р"),pk("о","О","о"),pk("л","Л","л"),pk("д","Д","д"),
+     pk("ж","Ж","ж"),pk("э","Э","э"),sk("Enter","return",2.25)],
+    [sk("Shift","shift",2.25),pk("я","Я","я"),pk("ч","Ч","ч"),pk("с","С","с"),pk("м","М","м"),
+     pk("и","И","и"),pk("т","Т","т"),pk("ь","Ь","ь"),pk("б","Б","б"),pk("ю","Ю","ю"),(  ".",",",".",1),
      sk("Shift","shift_r",2.75)],
     [sk("Ctrl","ctrl",1.25),sk("Win","cmd",1.25),sk("Alt","alt",1.25),
      sk("Space","space",6.25),
      sk("Alt","alt_r",1.25),sk("Win","cmd_r",1.25),sk("Menu","menu",1.25),sk("Ctrl","ctrl_r",1.25)],
 ],
 "ua_jcuken": [
-    [pk("ґ","Ґ","`"),pk("1","!","1"),pk("2",'"',"2"),pk("3","№","3"),pk("4",";","4"),pk("5","%","5"),
+    [pk("ґ","Ґ","ґ"),pk("1","!","1"),pk("2",'"',"2"),pk("3","№","3"),pk("4",";","4"),pk("5","%","5"),
      pk("6",":","6"),pk("7","?","7"),pk("8","*","8"),pk("9","(","9"),pk("0",")","0"),
      pk("-","_","-"),pk("=","+","="),sk("Bksp","backspace",2)],
-    [sk("Tab","tab",1.5),pk("й","Й","q"),pk("ц","Ц","w"),pk("у","У","e"),pk("к","К","r"),
-     pk("е","Е","t"),pk("н","Н","y"),pk("г","Г","u"),pk("ш","Ш","i"),pk("щ","Щ","o"),pk("з","З","p"),
-     pk("х","Х","["),pk("ї","Ї","]"),pk("\\","/",None,1.5)],
-    [sk("Caps","caps_lock",1.75),pk("ф","Ф","a"),pk("і","І","s"),pk("в","В","d"),pk("а","А","f"),
-     pk("п","П","g"),pk("р","Р","h"),pk("о","О","j"),pk("л","Л","k"),pk("д","Д","l"),
-     pk("ж","Ж",";"),pk("є","Є","'"),sk("Enter","return",2.25)],
-    [sk("Shift","shift",2.25),pk("я","Я","z"),pk("ч","Ч","x"),pk("с","С","c"),pk("м","М","v"),
-     pk("и","И","b"),pk("т","Т","n"),pk("ь","Ь","m"),pk("б","Б",","),pk("ю","Ю","."),(  ".",",","/",1),
+    [sk("Tab","tab",1.5),pk("й","Й","й"),pk("ц","Ц","ц"),pk("у","У","у"),pk("к","К","к"),
+     pk("е","Е","е"),pk("н","Н","н"),pk("г","Г","г"),pk("ш","Ш","ш"),pk("щ","Щ","щ"),pk("з","З","з"),
+     pk("х","Х","х"),pk("ї","Ї","ї"),pk("\\","/",None,1.5)],
+    [sk("Caps","caps_lock",1.75),pk("ф","Ф","ф"),pk("і","І","і"),pk("в","В","в"),pk("а","А","а"),
+     pk("п","П","п"),pk("р","Р","р"),pk("о","О","о"),pk("л","Л","л"),pk("д","Д","д"),
+     pk("ж","Ж","ж"),pk("є","Є","є"),sk("Enter","return",2.25)],
+    [sk("Shift","shift",2.25),pk("я","Я","я"),pk("ч","Ч","ч"),pk("с","С","с"),pk("м","М","м"),
+     pk("и","И","и"),pk("т","Т","т"),pk("ь","Ь","ь"),pk("б","Б","б"),pk("ю","Ю","ю"),(  ".",",",".",1),
      sk("Shift","shift_r",2.75)],
     [sk("Ctrl","ctrl",1.25),sk("Win","cmd",1.25),sk("Alt","alt",1.25),
      sk("Space","space",6.25),
@@ -941,6 +1068,18 @@ LAYOUTS = {
 ],
 }
 
+_WINDOWS_LAYOUT_SIGNATURES = {
+    layout_name: _layout_signature(layout_name) for layout_name in LAYOUTS
+}
+
+listener.start()
+
+_set_runtime_apps_cfg(_load_config()["apps"])
+
+if platform.system() == "Windows":
+    focus_thread = threading.Thread(target=_focus_watcher, daemon=True)
+    focus_thread.start()
+
 TOTAL_UNITS = max(sum(t[3] for t in row) for row in LAYOUTS["qwerty"])
 NUM_ROWS    = 5
 PAD_RATIO   = 0.008
@@ -949,6 +1088,7 @@ PAD_RATIO   = 0.008
 BG      = "#0d1117"
 OUTLINE = "#2d3748"
 EMPTY_KEY_COLOR = "#16192a"
+LOWEST_NONZERO_RATIO = 0.005
 
 # HSV heat model:
 # - Blue -> Green: hue and brightness both change.
@@ -956,14 +1096,16 @@ EMPTY_KEY_COLOR = "#16192a"
 BLUE_HUE_DEG = 230.0
 GREEN_HUE_DEG = 120.0
 RED_HUE_DEG = 0.0
-LOW_VALUE = 0.25
-MID_VALUE = 0.68
+LOW_VALUE = 0.20
+MID_VALUE = 0.60
+HIGH_VALUE = 0.96
 MID_SAT = 0.78
 FULL_SAT = 1.00
 
 def heat_color(ratio):
-    if ratio <= 0: return EMPTY_KEY_COLOR
+    if ratio <= LOWEST_NONZERO_RATIO: return EMPTY_KEY_COLOR
     ratio = max(0.0, min(1.0, float(ratio)))
+    ratio = (ratio - LOWEST_NONZERO_RATIO) / max(1e-9, (1.0 - LOWEST_NONZERO_RATIO))
     if ratio <= 0.5:
         t = ratio / 0.5
         hue = BLUE_HUE_DEG + t * (GREEN_HUE_DEG - BLUE_HUE_DEG)
@@ -973,7 +1115,9 @@ def heat_color(ratio):
         t = (ratio - 0.5) / 0.5
         hue = GREEN_HUE_DEG + t * (RED_HUE_DEG - GREEN_HUE_DEG)
         sat = MID_SAT + t * (FULL_SAT - MID_SAT)
-        val = MID_VALUE
+        # Brighten quickly after green so yellow doesn't look muddy.
+        boost = 1.0 - pow(1.0 - t, 0.45)
+        val = MID_VALUE + boost * (HIGH_VALUE - MID_VALUE)
     r, g, b = colorsys.hsv_to_rgb(hue / 360.0, sat, val)
     return "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
 def text_color(bg):
@@ -982,8 +1126,12 @@ def text_color(bg):
 
 def merge_all_counts(all_counts):
     merged = Counter()
-    for app_counts in all_counts.values():
-        merged.update(app_counts)
+    for layouts in all_counts.values():
+        if not isinstance(layouts, dict):
+            continue
+        for app_counts in layouts.values():
+            if isinstance(app_counts, Counter):
+                merged.update(app_counts)
     return merged
 
 def make_app_labels(app_ids):
@@ -1026,7 +1174,7 @@ class HeatmapWindow:
         self.config      = _load_config()
         self.color_cfg   = self.config["heatmap"]
         self.apps_cfg    = self.config["apps"]
-        self.layout_name = detect_layout()
+        self.layout_name = refresh_detected_layout()
         self.rows        = LAYOUTS[self.layout_name]
 
         self.root = tk.Tk()
@@ -1063,6 +1211,7 @@ class HeatmapWindow:
         self._app_to_group = {}
         self._app_labels = {}
         self._app_ids = []
+        self._seen_app_ids = set()
         self._group_state = {}
         self._app_state = {}
         self._filters_loaded_from_prefs = False
@@ -1084,6 +1233,7 @@ class HeatmapWindow:
         self.show_ws_var      = tk.BooleanVar(value=self.prefs.get("show_ws",      True))
 
         self._build_ui()
+        register_layout_change_callback(self._on_layout_detected)
         self._sync_filter_options()
         self._refresh()
         self.root.after(2000, self._auto_refresh)
@@ -1124,8 +1274,14 @@ class HeatmapWindow:
         hdr.pack(fill="x", padx=M, pady=(M,4))
         tk.Label(hdr, text="KEY HEATMAP", font=("Courier New",14,"bold"),
                  fg="#e8f4fd", bg=BG).pack(side="left")
-        tk.Label(hdr, text=f"[{self.layout_name.upper()}  auto-detected]",
-                 font=("Courier New",9), fg="#374151", bg=BG).pack(side="left", padx=10)
+        self.layout_lbl = tk.Label(
+            hdr,
+            text=self._layout_badge_text(),
+            font=("Courier New",9),
+            fg="#374151",
+            bg=BG,
+        )
+        self.layout_lbl.pack(side="left", padx=10)
         self._scale_mode_lbl = tk.Label(hdr, text="", font=("Courier New",9), fg="#4b5563", bg=BG)
         self._scale_mode_lbl.pack(side="left", padx=8)
         self.total_lbl = tk.Label(hdr, text="", font=("Courier New",10), fg="#6b7280", bg=BG)
@@ -1232,6 +1388,27 @@ class HeatmapWindow:
         })
         save_prefs(self.prefs)
 
+    def _layout_badge_text(self):
+        return f"[{self.layout_name.upper()}  auto-detected]"
+
+    def _apply_layout(self, layout_name):
+        resolved_name = layout_name if layout_name in LAYOUTS else "qwerty"
+        if resolved_name == self.layout_name:
+            return
+
+        self.layout_name = resolved_name
+        self.rows = LAYOUTS[self.layout_name]
+        self.root.title(f"Key Heatmap  [{self.layout_name.upper()}]")
+        self.layout_lbl.config(text=self._layout_badge_text())
+        self._hover_idx = None
+        self._draw_keys()
+        self._refresh()
+
+    def _on_layout_detected(self, layout_name):
+        if getattr(self, "root", None) is None:
+            return
+        self.root.after(0, lambda name=layout_name: self._apply_layout(name))
+
     def _reload_config(self):
         self.config = _load_config()
         self.color_cfg = self.config["heatmap"]
@@ -1250,6 +1427,7 @@ class HeatmapWindow:
 
     def _sync_filter_options(self, reset=False):
         app_ids = self._collect_app_ids()
+        new_app_ids = [app_id for app_id in app_ids if app_id not in self._seen_app_ids]
         labels_by_name = make_app_labels(app_ids)
         self._app_labels = {app_id: label for label, app_id in labels_by_name.items()}
         self._app_ids = app_ids
@@ -1303,6 +1481,10 @@ class HeatmapWindow:
             for app_id in app_ids:
                 self._app_state[app_id] = existing_state.get(app_id, True)
 
+        if self._filters_loaded_from_prefs and new_app_ids:
+            for app_id in new_app_ids:
+                self._app_state[app_id] = True
+
         if reset:
             for app_id in app_ids:
                 self._app_state[app_id] = True
@@ -1322,6 +1504,11 @@ class HeatmapWindow:
                 self._filters_structure_sig = sig
             else:
                 self._sync_filters_panel_values()
+
+        if self._filters_loaded_from_prefs and new_app_ids:
+            self._persist_prefs()
+
+        self._seen_app_ids = set(app_ids)
 
     def _selected_app_ids(self):
         return [app_id for app_id in self._app_ids if self._app_state.get(app_id, True)]
@@ -1483,12 +1670,21 @@ class HeatmapWindow:
     def _gathered_stats_snapshot(self):
         selected_ids = self._selected_app_ids()
         with counts_lock:
-            snap_by_app = {app_id: Counter(c) for app_id, c in counts_by_app.items()}
+            snap_by_app = {
+                app_id: {
+                    layout_name: Counter(layout_counts)
+                    for layout_name, layout_counts in layout_map.items()
+                    if isinstance(layout_counts, Counter)
+                }
+                for app_id, layout_map in counts_by_app.items()
+                if isinstance(layout_map, dict)
+            }
             active = current_app_id
 
         gathered_stats = Counter()
         for app_id in selected_ids:
-            gathered_stats.update(snap_by_app.get(app_id, Counter()))
+            app_layouts = snap_by_app.get(app_id, {})
+            gathered_stats.update(app_layouts.get(self.layout_name, Counter()))
 
         total_gathered = sum(gathered_stats.values()) or 1
         return gathered_stats, total_gathered, selected_ids, active
@@ -1790,6 +1986,8 @@ class HeatmapWindow:
 
         flush_stats_if_dirty()
         self._sync_filter_options()
+        # Persist after reset so removed apps are also forgotten from checked_apps/checked_groups.
+        self._persist_prefs()
         self._draw_keys()
         self._refresh()
 

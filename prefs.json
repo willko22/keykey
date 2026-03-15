@@ -12,12 +12,9 @@
   "show_ws": true,
   "group_filter": "All Groups",
   "checked_groups": [
-    "__others__",
     "coding"
   ],
   "checked_apps": [
-    "C:\\Users\\UserName\\AppData\\Local\\Discord\\app-1.0.9228\\Discord.exe",
-    "C:\\Users\\UserName\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
-    "C:\\Windows\\explorer.exe"
+    "C:\\Users\\UserName\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe"
   ]
 }
