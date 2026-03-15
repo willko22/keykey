@@ -1,13 +1,6 @@
 MAIN_VERSION = 2
-FEATURE_VERSION = 4
+FEATURE_VERSION = 5
 FIXES_VERSION = 0
-
-# TODO/FIX:
-# - russian and ukrainian detected keys only on second time.
-# - stats should also show russian/ukrainian when the layout is chosen 
-# - each character needs to be remembered in its for... and shown only when that layout is used... so russian dont show on english and wise versa.
-# - when app is added we need to immediatelly check it and add it to prefs as checked.
-# while having only few colors, the collors are off.  there is no darkest color. we always need darkest blue and brightest red. when we have some middle we add green and after that we correctly add inbetweens...
 
 """
 Key Heatmap – tracks keystrokes with heatmap visualization.
