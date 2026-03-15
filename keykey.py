@@ -1,23 +1,26 @@
 MAIN_VERSION = 2
-FEATURE_VERSION = 2
+FEATURE_VERSION = 4
 FIXES_VERSION = 0
+
+# TODO:
+# - Add Russian and Ukrainian keyboard layout support.
+# - Map Cyrillic VK codes to stable key_ids (same approach as Latin keys).
+# - Render the correct Cyrillic labels on the heatmap.
 
 """
 Key Heatmap – tracks keystrokes with heatmap visualization.
-Auto-detects keyboard layout (QWERTY/QWERTZ/AZERTY/Dvorak/Colemak).
+Auto-detects keyboard layout (QWERTY/QWERTZ/AZERTY/Dvorak/Colemak/RU/UA JCUKEN).
 """
 
-import json, sys, threading, platform, math, os, time, ctypes, subprocess
+import bisect
+import json, sys, threading, platform, os, time, ctypes, subprocess, colorsys
 from collections import Counter
 from pathlib import Path
 from pynput import keyboard as pynput_kb
 import tkinter as tk
 from tkinter import ttk
+import tomllib
 
-try:
-    import tomllib
-except Exception:
-    tomllib = None
 
 HAS_TRAY = platform.system() == "Windows"
 TRAY_IMPORT_ERROR = None if HAS_TRAY else "Native tray is only supported on Windows"
@@ -42,14 +45,9 @@ GROUP_ORDER = ("game", "coding", "office", "creative")
 OTHERS_GROUP_ID = "__others__"
 
 DEFAULT_CONFIG = {
-    "color": {
-        "scale_mode": "adaptive",   # adaptive | smooth | stepped
-        "percent_step": None,
-        "color_count": 20,
-        "gamma": 0.55,
-        "outlier_mode": "log",      # log | none
-        "log_base": 10.0,
-        "cap_percentile": 95.0,
+    "heatmap": {
+        "devider": 2.0,
+        "threshold": 1.0,
     },
     "apps": {
         "groups": {k: [] for k in GROUP_ORDER},
@@ -115,7 +113,7 @@ def _to_int(v, default):
 
 def _load_config():
     cfg = {
-        "color": dict(DEFAULT_CONFIG["color"]),
+        "heatmap": dict(DEFAULT_CONFIG["heatmap"]),
         "apps": {
             "groups": {k: [] for k in GROUP_ORDER},
             "title_contains": {k: [] for k in GROUP_ORDER},
@@ -132,33 +130,14 @@ def _load_config():
     except Exception:
         return cfg
 
-    color = raw.get("color")
-    if isinstance(color, dict):
-        mode = str(color.get("scale_mode", cfg["color"]["scale_mode"]))
-        mode = mode.strip().lower()
-        if mode in ("adaptive", "smooth", "stepped"):
-            cfg["color"]["scale_mode"] = mode
-
-        ps = color.get("percent_step", None)
-        if ps is None:
-            cfg["color"]["percent_step"] = None
-        else:
-            psv = _to_float(ps, None)
-            if psv is not None and psv > 0:
-                cfg["color"]["percent_step"] = psv
-
-        cfg["color"]["color_count"] = max(2, _to_int(color.get("color_count", cfg["color"]["color_count"]), cfg["color"]["color_count"]))
-        cfg["color"]["gamma"] = max(0.01, _to_float(color.get("gamma", cfg["color"]["gamma"]), cfg["color"]["gamma"]))
-
-        outlier_mode = str(color.get("outlier_mode", cfg["color"]["outlier_mode"]))
-        outlier_mode = outlier_mode.strip().lower()
-        if outlier_mode in ("log", "none"):
-            cfg["color"]["outlier_mode"] = outlier_mode
-
-        cfg["color"]["log_base"] = max(1.0001, _to_float(color.get("log_base", cfg["color"]["log_base"]), cfg["color"]["log_base"]))
-
-        cap_pct = _to_float(color.get("cap_percentile", cfg["color"]["cap_percentile"]), cfg["color"]["cap_percentile"])
-        cfg["color"]["cap_percentile"] = min(100.0, max(50.0, cap_pct))
+    heatmap = raw.get("heatmap")
+    if not isinstance(heatmap, dict):
+        # Backward-compatibility for legacy configs using [color].
+        heatmap = raw.get("color")
+    if isinstance(heatmap, dict):
+        cfg["heatmap"]["devider"] = max(0.0001, _to_float(heatmap.get("devider", cfg["heatmap"]["devider"]), cfg["heatmap"]["devider"]))
+        threshold = _to_float(heatmap.get("threshold", cfg["heatmap"]["threshold"]), cfg["heatmap"]["threshold"])
+        cfg["heatmap"]["threshold"] = min(100.0, max(0.0, threshold))
 
     apps = raw.get("apps")
     if isinstance(apps, dict):
@@ -268,60 +247,70 @@ def _is_excluded_app(app_id, apps_cfg):
             return True
     return False
 
-def _percentile(values, pct):
-    if not values:
-        return 0.0
-    s = sorted(values)
-    if len(s) == 1:
-        return float(s[0])
-    p = max(0.0, min(100.0, float(pct))) / 100.0
-    i = p * (len(s) - 1)
-    lo = int(math.floor(i))
-    hi = int(math.ceil(i))
-    if lo == hi:
-        return float(s[lo])
-    t = i - lo
-    return float(s[lo] + (s[hi] - s[lo]) * t)
-
-def _effective_color_bins(color_cfg):
-    ps = color_cfg.get("percent_step")
-    if ps is not None:
-        ps = _to_float(ps, None)
-        if ps is not None and ps > 0:
-            return max(2, int(round(100.0 / ps)))
-    return max(2, _to_int(color_cfg.get("color_count", 20), 20))
-
 def _build_color_ratio_fn(snap, color_cfg):
-    vals = [v for v in snap.values() if v > 0]
-    if not vals:
+    ordered_values = sorted({int(v) for v in snap.values() if v > 0})
+    if not ordered_values:
         return lambda v: 0.0
 
-    mode = color_cfg.get("scale_mode", "adaptive")
-    outlier_mode = color_cfg.get("outlier_mode", "log")
-    cap_pct = color_cfg.get("cap_percentile", 95.0)
-    cap = max(vals)
+    devider = max(0.0001, _to_float(color_cfg.get("devider", 2.0), 2.0))
+    threshold = min(100.0, max(0.0, _to_float(color_cfg.get("threshold", 15.0), 15.0)))
 
-    if mode in ("adaptive", "stepped"):
-        cap = max(1.0, _percentile(vals, cap_pct))
+    group_by_value = {}
+    group_values = [[ordered_values[0]]]
+    current_group = 0
+    group_min = float(ordered_values[0])
+    p = threshold
+
+    group_by_value[ordered_values[0]] = 0
+    for value in ordered_values[1:]:
+        v = float(value)
+        scaled_v = v / devider
+        diff_pct = abs(scaled_v - group_min) / max(1e-9, group_min) * 100.0
+        if diff_pct >= p:
+            current_group += 1
+            group_min = v
+            group_values.append([])
+        group_by_value[value] = current_group
+        group_values[current_group].append(value)
+
+    group_count = len(group_values)
+    ratio_by_value = {}
+    if group_count == 1:
+        values = group_values[0]
+        n = len(values)
+        if n <= 1:
+            ratio_by_value[values[0]] = 1.0
+        else:
+            # Single category: preserve gradient from low to high.
+            for i, value in enumerate(values):
+                ratio_by_value[value] = i / (n - 1)
     else:
-        cap = max(1.0, float(cap))
-
-    use_log = mode in ("adaptive", "stepped") and outlier_mode == "log"
-    if use_log:
-        base = max(1.0001, _to_float(color_cfg.get("log_base", 10.0), 10.0))
-        denom = math.log(1.0 + cap, base)
-        if denom <= 0:
-            denom = 1.0
-
-        def ratio_fn(v):
-            vv = min(max(0.0, float(v)), cap)
-            return max(0.0, min(1.0, math.log(1.0 + vv, base) / denom))
-
-        return ratio_fn
+        # Group anchors map evenly from blue (0) to red (1).
+        # Example for 7 groups: 0, 1/6, 2/6, 3/6, 4/6, 5/6, 1.
+        denom = group_count - 1
+        for gi, values in enumerate(group_values):
+            n = len(values)
+            g_lo = gi / denom
+            if n <= 1:
+                ratio_by_value[values[0]] = g_lo
+                continue
+            if gi < denom:
+                g_hi = (gi + 1) / denom
+            else:
+                g_hi = 1.0
+            for i, value in enumerate(values):
+                within = i / (n - 1)
+                ratio_by_value[value] = g_lo + within * (g_hi - g_lo)
 
     def ratio_fn(v):
-        vv = min(max(0.0, float(v)), cap)
-        return max(0.0, min(1.0, vv / cap))
+        vv = int(max(0.0, float(v)))
+        if vv <= 0:
+            return 0.0
+        pos = bisect.bisect_right(ordered_values, vv) - 1
+        if pos < 0:
+            return max(0.0, min(1.0, ratio_by_value[ordered_values[0]]))
+        mapped = ordered_values[pos]
+        return max(0.0, min(1.0, ratio_by_value[mapped]))
 
     return ratio_fn
 
@@ -442,7 +431,25 @@ def _handle_existing_instance_upgrade():
         return True
 
     exe_name = Path(sys.executable).name
+    current_exe = str(Path(sys.executable).resolve()).lower()
+    parent_pid = os.getppid()
+
     others = _list_running_keykey_exe_paths(exe_name)
+    filtered = []
+    for pid, exe_path in others:
+        try:
+            other_exe = str(Path(exe_path).resolve()).lower()
+        except Exception:
+            other_exe = str(exe_path).lower()
+
+        # Ignore unrelated binaries with same filename and bootloader parent.
+        if other_exe != current_exe:
+            continue
+        if int(pid) == int(parent_pid):
+            continue
+        filtered.append((pid, exe_path))
+
+    others = filtered
     if not others:
         return True
 
@@ -450,7 +457,7 @@ def _handle_existing_instance_upgrade():
     for pid, exe_path in others:
         running_ver = _query_exe_version(exe_path)
         if running_ver is None:
-            allow_start = False
+            # Do not block startup on transient query failures.
             continue
 
         if _is_newer_version(APP_VERSION, running_ver):
@@ -772,6 +779,8 @@ _LANG_TO_LAYOUT = {
     0x0407:"qwertz", 0x0807:"qwertz", 0x0c07:"qwertz",
     0x041b:"qwertz", 0x0405:"qwertz", 0x040e:"qwertz",
     0x040c:"azerty", 0x080c:"azerty", 0x100c:"azerty",
+    0x0419:"ru_jcuken", 0x0819:"ru_jcuken", 0x2019:"ru_jcuken",
+    0x0422:"ua_jcuken", 0x0822:"ua_jcuken",
 }
 
 def detect_layout():
@@ -794,6 +803,8 @@ def detect_layout():
             v = line.split(":")[-1].strip().lower()
             if "dvorak"  in v: return "dvorak"
             if "colemak" in v: return "colemak"
+            if v.startswith("ru"): return "ru_jcuken"
+            if v.startswith("uk") or v.startswith("ua"): return "ua_jcuken"
             if any(v.startswith(x) for x in ("de","sk","cz","hu")): return "qwertz"
             if any(v.startswith(x) for x in ("fr","be")):           return "azerty"
     except Exception: pass
@@ -861,7 +872,40 @@ LAYOUTS = {
      sk("Space","space",6.25),
      sk("AltGr","alt_r",1.25),sk("Win","cmd_r",1.25),sk("Menu","menu",1.25),sk("Ctrl","ctrl_r",1.25)],
 ],
-"dvorak": [
+"ru_jcuken": [
+    [pk("ё","Ё","`"),pk("1","!","1"),pk("2",'"',"2"),pk("3","№","3"),pk("4",";","4"),pk("5","%","5"),
+     pk("6",":","6"),pk("7","?","7"),pk("8","*","8"),pk("9","(","9"),pk("0",")","0"),
+     pk("-","_","-"),pk("=","+","="),sk("Bksp","backspace",2)],
+    [sk("Tab","tab",1.5),pk("й","Й","q"),pk("ц","Ц","w"),pk("у","У","e"),pk("к","К","r"),
+     pk("е","Е","t"),pk("н","Н","y"),pk("г","Г","u"),pk("ш","Ш","i"),pk("щ","Щ","o"),pk("з","З","p"),
+     pk("х","Х","["),pk("ъ","Ъ","]"),pk("\\","/",None,1.5)],
+    [sk("Caps","caps_lock",1.75),pk("ф","Ф","a"),pk("ы","Ы","s"),pk("в","В","d"),pk("а","А","f"),
+     pk("п","П","g"),pk("р","Р","h"),pk("о","О","j"),pk("л","Л","k"),pk("д","Д","l"),
+     pk("ж","Ж",";"),pk("э","Э","'"),sk("Enter","return",2.25)],
+    [sk("Shift","shift",2.25),pk("я","Я","z"),pk("ч","Ч","x"),pk("с","С","c"),pk("м","М","v"),
+     pk("и","И","b"),pk("т","Т","n"),pk("ь","Ь","m"),pk("б","Б",","),pk("ю","Ю","."),(  ".",",","/",1),
+     sk("Shift","shift_r",2.75)],
+    [sk("Ctrl","ctrl",1.25),sk("Win","cmd",1.25),sk("Alt","alt",1.25),
+     sk("Space","space",6.25),
+     sk("Alt","alt_r",1.25),sk("Win","cmd_r",1.25),sk("Menu","menu",1.25),sk("Ctrl","ctrl_r",1.25)],
+],
+"ua_jcuken": [
+    [pk("ґ","Ґ","`"),pk("1","!","1"),pk("2",'"',"2"),pk("3","№","3"),pk("4",";","4"),pk("5","%","5"),
+     pk("6",":","6"),pk("7","?","7"),pk("8","*","8"),pk("9","(","9"),pk("0",")","0"),
+     pk("-","_","-"),pk("=","+","="),sk("Bksp","backspace",2)],
+    [sk("Tab","tab",1.5),pk("й","Й","q"),pk("ц","Ц","w"),pk("у","У","e"),pk("к","К","r"),
+     pk("е","Е","t"),pk("н","Н","y"),pk("г","Г","u"),pk("ш","Ш","i"),pk("щ","Щ","o"),pk("з","З","p"),
+     pk("х","Х","["),pk("ї","Ї","]"),pk("\\","/",None,1.5)],
+    [sk("Caps","caps_lock",1.75),pk("ф","Ф","a"),pk("і","І","s"),pk("в","В","d"),pk("а","А","f"),
+     pk("п","П","g"),pk("р","Р","h"),pk("о","О","j"),pk("л","Л","k"),pk("д","Д","l"),
+     pk("ж","Ж",";"),pk("є","Є","'"),sk("Enter","return",2.25)],
+    [sk("Shift","shift",2.25),pk("я","Я","z"),pk("ч","Ч","x"),pk("с","С","c"),pk("м","М","v"),
+     pk("и","И","b"),pk("т","Т","n"),pk("ь","Ь","m"),pk("б","Б",","),pk("ю","Ю","."),(  ".",",","/",1),
+     sk("Shift","shift_r",2.75)],
+    [sk("Ctrl","ctrl",1.25),sk("Win","cmd",1.25),sk("Alt","alt",1.25),
+     sk("Space","space",6.25),
+     sk("Alt","alt_r",1.25),sk("Win","cmd_r",1.25),sk("Menu","menu",1.25),sk("Ctrl","ctrl_r",1.25)],
+],"dvorak": [
     [pk("`","~"),pk("1","!"),pk("2","@"),pk("3","#"),pk("4","$"),pk("5","%"),
      pk("6","^"),pk("7","&"),pk("8","*"),pk("9","("),pk("0",")"),
      pk("[","{","["),pk("]","}","]"),sk("Bksp","backspace",2)],
@@ -904,31 +948,34 @@ PAD_RATIO   = 0.008
 # ── colors ────────────────────────────────────────────────────────────────────
 BG      = "#0d1117"
 OUTLINE = "#2d3748"
+EMPTY_KEY_COLOR = "#16192a"
 
-HEAT_STOPS = [
-    (0.00,(22,28,42)),  (0.04,(24,48,80)),  (0.08,(18,72,110)),
-    (0.13,(16,96,130)), (0.18,(14,118,130)),(0.24,(16,135,118)),
-    (0.30,(18,148,100)),(0.37,(30,158,70)), (0.44,(55,168,45)),
-    (0.51,(90,175,25)), (0.58,(145,182,18)),(0.65,(195,190,18)),
-    (0.72,(225,185,18)),(0.79,(238,155,16)),(0.86,(242,110,16)),
-    (0.92,(242,65,18)), (0.96,(238,38,18)), (1.00,(230,20,10)),
-]
+# HSV heat model:
+# - Blue -> Green: hue and brightness both change.
+# - Green -> Red: hue changes (passing through yellow), brightness fixed.
+BLUE_HUE_DEG = 230.0
+GREEN_HUE_DEG = 120.0
+RED_HUE_DEG = 0.0
+LOW_VALUE = 0.25
+MID_VALUE = 0.68
+MID_SAT = 0.78
+FULL_SAT = 1.00
 
-def heat_color(ratio, gamma=0.55, bins=None):
-    if ratio <= 0: return "#16192a"
-    ratio = math.pow(max(0.0, min(1.0, ratio)), max(0.01, float(gamma)))
-    if bins and bins > 1:
-        ratio = round(ratio * (bins - 1)) / (bins - 1)
-    for i in range(len(HEAT_STOPS)-1):
-        r0,c0 = HEAT_STOPS[i]; r1,c1 = HEAT_STOPS[i+1]
-        if r0 <= ratio <= r1:
-            t = (ratio-r0)/(r1-r0)
-            return "#{:02x}{:02x}{:02x}".format(
-                int(c0[0]+t*(c1[0]-c0[0])),
-                int(c0[1]+t*(c1[1]-c0[1])),
-                int(c0[2]+t*(c1[2]-c0[2])))
-    return "#e6140a"
-
+def heat_color(ratio):
+    if ratio <= 0: return EMPTY_KEY_COLOR
+    ratio = max(0.0, min(1.0, float(ratio)))
+    if ratio <= 0.5:
+        t = ratio / 0.5
+        hue = BLUE_HUE_DEG + t * (GREEN_HUE_DEG - BLUE_HUE_DEG)
+        sat = FULL_SAT + t * (MID_SAT - FULL_SAT)
+        val = LOW_VALUE + t * (MID_VALUE - LOW_VALUE)
+    else:
+        t = (ratio - 0.5) / 0.5
+        hue = GREEN_HUE_DEG + t * (RED_HUE_DEG - GREEN_HUE_DEG)
+        sat = MID_SAT + t * (FULL_SAT - MID_SAT)
+        val = MID_VALUE
+    r, g, b = colorsys.hsv_to_rgb(hue / 360.0, sat, val)
+    return "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
 def text_color(bg):
     r,g,b = int(bg[1:3],16),int(bg[3:5],16),int(bg[5:7],16)
     return "#fff" if (0.299*r+0.587*g+0.114*b) < 145 else "#111"
@@ -977,7 +1024,7 @@ class HeatmapWindow:
         self._tray_mode = HAS_TRAY
         self.prefs       = load_prefs()
         self.config      = _load_config()
-        self.color_cfg   = self.config["color"]
+        self.color_cfg   = self.config["heatmap"]
         self.apps_cfg    = self.config["apps"]
         self.layout_name = detect_layout()
         self.rows        = LAYOUTS[self.layout_name]
@@ -1028,6 +1075,7 @@ class HeatmapWindow:
         self._bars_indicator_tag = "__bars_indicator__"
         self._bars_snap  = {}
         self._bars_total = 1
+        self._bars_ratio_fn = lambda _v: 0.0
         self._scale_mode_lbl = None
         self.show_alpha_var   = tk.BooleanVar(value=self.prefs.get("show_alpha",   True))
         self.show_numeral_var = tk.BooleanVar(value=self.prefs.get("show_numeral", True))
@@ -1186,7 +1234,7 @@ class HeatmapWindow:
 
     def _reload_config(self):
         self.config = _load_config()
-        self.color_cfg = self.config["color"]
+        self.color_cfg = self.config["heatmap"]
         self.apps_cfg = self.config["apps"]
         _set_runtime_apps_cfg(self.apps_cfg)
 
@@ -1414,16 +1462,9 @@ class HeatmapWindow:
         self._refresh()
 
     def _scale_mode_text(self):
-        mode = self.color_cfg.get("scale_mode", "adaptive")
-        if mode == "stepped":
-            bins = _effective_color_bins(self.color_cfg)
-            ps = self.color_cfg.get("percent_step")
-            if ps is not None:
-                return f"[stepped {ps:g}% -> {bins} bins]"
-            return f"[stepped {bins} bins]"
-        if mode == "adaptive":
-            return "[adaptive scale]"
-        return "[smooth scale]"
+        d = max(0.0001, _to_float(self.color_cfg.get("devider", 2.0), 2.0))
+        t = min(100.0, max(0.0, _to_float(self.color_cfg.get("threshold", 15.0), 15.0)))
+        return f"[grouped d={d:g} t={t:g}%]"
 
     def _filtered_snap(self, snap):
         show = {
@@ -1437,18 +1478,30 @@ class HeatmapWindow:
             return snap
         return Counter({k: v for k, v in snap.items() if show[_key_category(k)]})
 
-    def _selected_snapshot(self):
+    # Naming model:
+    # gathered stats -> filtered stats -> graph/heatmap rendering.
+    def _gathered_stats_snapshot(self):
         selected_ids = self._selected_app_ids()
         with counts_lock:
             snap_by_app = {app_id: Counter(c) for app_id, c in counts_by_app.items()}
             active = current_app_id
 
-        snap = Counter()
+        gathered_stats = Counter()
         for app_id in selected_ids:
-            snap.update(snap_by_app.get(app_id, Counter()))
+            gathered_stats.update(snap_by_app.get(app_id, Counter()))
 
-        total = sum(snap.values()) or 1
-        return snap, total, selected_ids, active
+        total_gathered = sum(gathered_stats.values()) or 1
+        return gathered_stats, total_gathered, selected_ids, active
+
+    def _filtered_stats_snapshot(self):
+        gathered_stats, _total_gathered, selected_ids, active = self._gathered_stats_snapshot()
+        filtered_stats = self._filtered_snap(gathered_stats)
+        total_filtered = sum(filtered_stats.values()) or 1
+        return filtered_stats, total_filtered, selected_ids, active
+
+    def _selected_snapshot(self):
+        # Backward-compatible alias for existing call-sites.
+        return self._filtered_stats_snapshot()
 
     def _draw_keys(self):
         cw = self.canvas.winfo_width()
@@ -1473,11 +1526,8 @@ class HeatmapWindow:
         self.canvas.delete("all")
         self.key_cells.clear()
 
-        snap, _, _, _ = self._selected_snapshot()
-        snap = self._filtered_snap(snap)
-        ratio_fn = _build_color_ratio_fn(snap, self.color_cfg)
-        gamma = self.color_cfg.get("gamma", 0.55)
-        bins = _effective_color_bins(self.color_cfg) if self.color_cfg.get("scale_mode") == "stepped" else None
+        filtered_stats, _, _, _ = self._filtered_stats_snapshot()
+        ratio_fn = _build_color_ratio_fn(filtered_stats, self.color_cfg)
 
         def on_enter(idx):
             self._hover_idx = idx
@@ -1492,9 +1542,13 @@ class HeatmapWindow:
             for tup in row:
                 n, s, kid, width = tup
                 w     = width*unit + (width-1)*pad
-                v     = snap.get(kid, 0)
-                ratio = ratio_fn(v)
-                bg    = heat_color(ratio, gamma=gamma, bins=bins)
+                v     = filtered_stats.get(kid, 0)
+                if v <= 0:
+                    ratio = 0.0
+                    bg = EMPTY_KEY_COLOR
+                else:
+                    ratio = ratio_fn(v)
+                    bg = heat_color(ratio)
                 fg    = text_color(bg)
                 ol    = BG if ratio > 0.05 else OUTLINE
 
@@ -1604,17 +1658,17 @@ class HeatmapWindow:
 
     def _refresh(self):
         self._sync_filter_options()
-        snap, total, selected_ids, active = self._selected_snapshot()
-        snap = self._filtered_snap(snap)
-        total = sum(snap.values()) or 1
-        ratio_fn = _build_color_ratio_fn(snap, self.color_cfg)
-        gamma = self.color_cfg.get("gamma", 0.55)
-        bins = _effective_color_bins(self.color_cfg) if self.color_cfg.get("scale_mode") == "stepped" else None
+        filtered_stats, total, selected_ids, active = self._filtered_stats_snapshot()
+        ratio_fn = _build_color_ratio_fn(filtered_stats, self.color_cfg)
 
         for cell in self.key_cells:
-            v     = snap.get(cell["kid"],0)
-            ratio = ratio_fn(v)
-            bg    = heat_color(ratio, gamma=gamma, bins=bins)
+            v     = filtered_stats.get(cell["kid"],0)
+            if v <= 0:
+                ratio = 0.0
+                bg = EMPTY_KEY_COLOR
+            else:
+                ratio = ratio_fn(v)
+                bg = heat_color(ratio)
             fg    = text_color(bg)
             ol    = BG if ratio>0.05 else OUTLINE
             self.canvas.itemconfig(cell["rect"],fill=bg,outline=ol)
@@ -1635,11 +1689,12 @@ class HeatmapWindow:
         self.total_lbl.config(text=f"{total:,} keystrokes  |  {scope}{active_label}")
         if self._scale_mode_lbl is not None:
             self._scale_mode_lbl.config(text=self._scale_mode_text())
-        self._update_bars(snap,total)
+        self._update_bars(filtered_stats, total, ratio_fn)
 
-    def _update_bars(self,snap,total):
+    def _update_bars(self, snap, total, ratio_fn):
         self._bars_snap  = snap
         self._bars_total = total
+        self._bars_ratio_fn = ratio_fn
         self._redraw_bars()
 
     def _redraw_bars(self):
@@ -1657,9 +1712,7 @@ class HeatmapWindow:
             rows = rows[:10]
 
         max_v  = rows[0][1]
-        ratio_fn = _build_color_ratio_fn(dict(rows), self.color_cfg)
-        gamma = self.color_cfg.get("gamma", 0.55)
-        bins = _effective_color_bins(self.color_cfg) if self.color_cfg.get("scale_mode") == "stepped" else None
+        ratio_fn = self._bars_ratio_fn
         row_h  = 14
         lbl_w  = 90
         num_w  = 120
@@ -1674,7 +1727,7 @@ class HeatmapWindow:
                            anchor="e",font=("Courier New",8),fill="#94a3b8")
             bc.create_rectangle(bar_x0,y,bar_x0+bar_w,y+row_h,fill="#1a2030",outline="")
             bc.create_rectangle(bar_x0,y,bar_x0+max(2,int(bar_w*ratio_raw)),y+row_h,
-                                fill=heat_color(ratio_col, gamma=gamma, bins=bins),outline="")
+                                fill=heat_color(ratio_col),outline="")
             bc.create_text(bar_x0+bar_w+6,cy,text=f"{v:,}  ({pct:.1f}%)",
                            anchor="w",font=("Courier New",8),fill="#64748b")
         content_h = len(rows) * (row_h + 3) + 6
@@ -1690,10 +1743,8 @@ class HeatmapWindow:
         if not (0 <= idx < len(self.key_cells)):
             return
         cell = self.key_cells[idx]
-        snap, _, _, _ = self._selected_snapshot()
-        snap = self._filtered_snap(snap)
-        total = sum(snap.values()) or 1
-        pct = (100.0 * snap.get(cell["kid"], 0)) / total
+        filtered_stats, total, _, _ = self._filtered_stats_snapshot()
+        pct = (100.0 * filtered_stats.get(cell["kid"], 0)) / total
         txt = f"{pct:.1f}%"
         if len(cell["texts"]) == 1:
             self.canvas.itemconfig(cell["texts"][0], text=txt)
@@ -2048,9 +2099,6 @@ if __name__ == "__main__":
             win.root.destroy()
         except Exception:
             pass
-
-
-
 
 
 
