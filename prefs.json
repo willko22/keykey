@@ -1,0 +1,27 @@
+{
+  "w": 1137,
+  "h": 681,
+  "x": 584,
+  "y": 152,
+  "no_special": true,
+  "show_alpha": true,
+  "show_numbers": true,
+  "show_symbols": true,
+  "show_special": true,
+  "show_numeral": true,
+  "show_ws": true,
+  "group_filter": "All Groups",
+  "checked_groups": [
+    "__others__",
+    "coding",
+    "game"
+  ],
+  "checked_apps": [
+    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\dota 2 beta\\game\\bin\\win64\\dota2.exe",
+    "C:\\Users\\UserName\\AppData\\Local\\Discord\\app-1.0.9228\\Discord.exe",
+    "C:\\Users\\UserName\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
+    "C:\\Users\\UserName\\AppData\\Local\\Vivaldi\\Application\\vivaldi.exe",
+    "C:\\Users\\UserName\\AppData\\Roaming\\Spotify\\Spotify.exe",
+    "C:\\Windows\\explorer.exe"
+  ]
+}

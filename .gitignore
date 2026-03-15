@@ -4,3 +4,4 @@ dist/
 .venv/
 keykey.spec
 stats.json
+*.zip

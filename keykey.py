@@ -1,15 +1,23 @@
-#!/usr/bin/env python3
+MAIN_VERSION = 2
+FEATURE_VERSION = 2
+FIXES_VERSION = 0
+
 """
 Key Heatmap – tracks keystrokes with heatmap visualization.
 Auto-detects keyboard layout (QWERTY/QWERTZ/AZERTY/Dvorak/Colemak).
 """
 
-import json, sys, threading, platform, math, os, time, ctypes
+import json, sys, threading, platform, math, os, time, ctypes, subprocess
 from collections import Counter
 from pathlib import Path
 from pynput import keyboard as pynput_kb
 import tkinter as tk
 from tkinter import ttk
+
+try:
+    import tomllib
+except Exception:
+    tomllib = None
 
 HAS_TRAY = platform.system() == "Windows"
 TRAY_IMPORT_ERROR = None if HAS_TRAY else "Native tray is only supported on Windows"
@@ -20,12 +28,438 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = Path(__file__).resolve().parent
 SAVE_FILE  = BASE_DIR / "stats.json"
-PREFS_FILE = Path.home() / ".key_heatmap_prefs.json"
+PREFS_FILE = BASE_DIR / "prefs.json"
+LEGACY_PREFS_FILE = Path.home() / ".key_heatmap_prefs.json"
+CONFIG_FILE = BASE_DIR / "keykey.toml"
 ICON_FILE  = BASE_DIR / "keykey.ico"
 APP_ALL_ID = "__all__"
 UNATTRIBUTED_APP_ID = "__unattributed__"
 DOTA2_APP_ID = "__dota2__"
 WINDOW_TITLE_PREFIX = "window::"
+APP_VERSION = f"{MAIN_VERSION}.{FEATURE_VERSION}.{FIXES_VERSION}"
+
+GROUP_ORDER = ("game", "coding", "office", "creative")
+OTHERS_GROUP_ID = "__others__"
+
+DEFAULT_CONFIG = {
+    "color": {
+        "scale_mode": "adaptive",   # adaptive | smooth | stepped
+        "percent_step": None,
+        "color_count": 20,
+        "gamma": 0.55,
+        "outlier_mode": "log",      # log | none
+        "log_base": 10.0,
+        "cap_percentile": 95.0,
+    },
+    "apps": {
+        "groups": {k: [] for k in GROUP_ORDER},
+        "title_contains": {k: [] for k in GROUP_ORDER},
+        "exclude": [],
+    },
+}
+
+def _normalize_group_id(value):
+    if not isinstance(value, str):
+        return None
+    gid = value.strip().lower().replace(" ", "_")
+    if not gid or gid == OTHERS_GROUP_ID:
+        return None
+    return gid
+
+def _configured_group_ids(apps_cfg):
+    groups = apps_cfg.get("groups", {}) if isinstance(apps_cfg, dict) else {}
+    titles = apps_cfg.get("title_contains", {}) if isinstance(apps_cfg, dict) else {}
+
+    ids = set()
+    for k in groups.keys():
+        gid = _normalize_group_id(k)
+        if gid:
+            ids.add(gid)
+    for k in titles.keys():
+        gid = _normalize_group_id(k)
+        if gid:
+            ids.add(gid)
+
+    if not ids:
+        ids.update(GROUP_ORDER)
+
+    return sorted(ids, key=lambda s: s.lower())
+
+def _group_display_name(group_id):
+    if group_id == OTHERS_GROUP_ID:
+        return "Others"
+    return str(group_id).replace("_", " ").title()
+
+def _clean_string_list(v):
+    if not isinstance(v, list):
+        return []
+    out = []
+    for item in v:
+        if isinstance(item, str):
+            s = item.strip()
+            if s:
+                out.append(s)
+    return out
+
+def _to_float(v, default):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+def _to_int(v, default):
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+def _load_config():
+    cfg = {
+        "color": dict(DEFAULT_CONFIG["color"]),
+        "apps": {
+            "groups": {k: [] for k in GROUP_ORDER},
+            "title_contains": {k: [] for k in GROUP_ORDER},
+            "exclude": [],
+        },
+    }
+
+    if not CONFIG_FILE.exists() or tomllib is None:
+        return cfg
+
+    try:
+        with open(CONFIG_FILE, "rb") as f:
+            raw = tomllib.load(f)
+    except Exception:
+        return cfg
+
+    color = raw.get("color")
+    if isinstance(color, dict):
+        mode = str(color.get("scale_mode", cfg["color"]["scale_mode"]))
+        mode = mode.strip().lower()
+        if mode in ("adaptive", "smooth", "stepped"):
+            cfg["color"]["scale_mode"] = mode
+
+        ps = color.get("percent_step", None)
+        if ps is None:
+            cfg["color"]["percent_step"] = None
+        else:
+            psv = _to_float(ps, None)
+            if psv is not None and psv > 0:
+                cfg["color"]["percent_step"] = psv
+
+        cfg["color"]["color_count"] = max(2, _to_int(color.get("color_count", cfg["color"]["color_count"]), cfg["color"]["color_count"]))
+        cfg["color"]["gamma"] = max(0.01, _to_float(color.get("gamma", cfg["color"]["gamma"]), cfg["color"]["gamma"]))
+
+        outlier_mode = str(color.get("outlier_mode", cfg["color"]["outlier_mode"]))
+        outlier_mode = outlier_mode.strip().lower()
+        if outlier_mode in ("log", "none"):
+            cfg["color"]["outlier_mode"] = outlier_mode
+
+        cfg["color"]["log_base"] = max(1.0001, _to_float(color.get("log_base", cfg["color"]["log_base"]), cfg["color"]["log_base"]))
+
+        cap_pct = _to_float(color.get("cap_percentile", cfg["color"]["cap_percentile"]), cfg["color"]["cap_percentile"])
+        cfg["color"]["cap_percentile"] = min(100.0, max(50.0, cap_pct))
+
+    apps = raw.get("apps")
+    if isinstance(apps, dict):
+        cfg["apps"]["exclude"] = _clean_string_list(apps.get("exclude", []))
+
+        parsed_groups = None
+        groups = apps.get("groups")
+        if isinstance(groups, dict):
+            parsed_groups = {}
+            for key, vals in groups.items():
+                gid = _normalize_group_id(key)
+                if gid:
+                    parsed_groups[gid] = _clean_string_list(vals)
+
+        parsed_titles = None
+        title_contains = apps.get("title_contains")
+        if isinstance(title_contains, dict):
+            parsed_titles = {}
+            for key, vals in title_contains.items():
+                gid = _normalize_group_id(key)
+                if gid:
+                    parsed_titles[gid] = _clean_string_list(vals)
+
+        if parsed_groups is not None:
+            cfg["apps"]["groups"] = parsed_groups
+        if parsed_titles is not None:
+            cfg["apps"]["title_contains"] = parsed_titles
+
+        all_group_ids = set(cfg["apps"]["groups"].keys()) | set(cfg["apps"]["title_contains"].keys())
+        if not all_group_ids:
+            all_group_ids = set(GROUP_ORDER)
+        cfg["apps"]["groups"] = {
+            gid: _clean_string_list(cfg["apps"]["groups"].get(gid, [])) for gid in all_group_ids
+        }
+        cfg["apps"]["title_contains"] = {
+            gid: _clean_string_list(cfg["apps"]["title_contains"].get(gid, [])) for gid in all_group_ids
+        }
+
+    return cfg
+
+def _matches_group(app_id, group_id, apps_cfg):
+    groups = apps_cfg.get("groups", {})
+    titles = apps_cfg.get("title_contains", {})
+    rules = [r.lower() for r in groups.get(group_id, [])]
+    title_rules = [r.lower() for r in titles.get(group_id, [])]
+
+    app_low = (app_id or "").lower()
+    disp = (_display_app_label(app_id) or "").lower()
+    stem = ""
+    name = ""
+    title = ""
+    if app_id and app_id.startswith(WINDOW_TITLE_PREFIX):
+        title = app_id[len(WINDOW_TITLE_PREFIX):].lower()
+    else:
+        p = Path(app_id or "")
+        stem = p.stem.lower()
+        name = p.name.lower()
+
+    for rule in rules:
+        if not rule:
+            continue
+        if rule in (stem, name, disp):
+            return True
+        if rule in app_low or (disp and rule in disp):
+            return True
+
+    hay_title = title or disp
+    for rule in title_rules:
+        if rule and rule in hay_title:
+            return True
+
+    return False
+
+def _infer_app_group(app_id, apps_cfg):
+    for g in _configured_group_ids(apps_cfg):
+        if _matches_group(app_id, g, apps_cfg):
+            return g
+    return None
+
+def _is_excluded_app(app_id, apps_cfg):
+    if not app_id or not isinstance(apps_cfg, dict):
+        return False
+
+    excludes = [s.lower() for s in _clean_string_list(apps_cfg.get("exclude", []))]
+    if not excludes:
+        return False
+
+    app_low = str(app_id).lower()
+    disp = (_display_app_label(app_id) or "").lower()
+    stem = ""
+    name = ""
+    title = ""
+
+    if app_id.startswith(WINDOW_TITLE_PREFIX):
+        title = app_id[len(WINDOW_TITLE_PREFIX):].lower()
+    else:
+        p = Path(app_id)
+        stem = p.stem.lower()
+        name = p.name.lower()
+
+    for token in excludes:
+        if not token:
+            continue
+        if token in app_low or (disp and token in disp) or (title and token in title):
+            return True
+        if token in (stem, name):
+            return True
+    return False
+
+def _percentile(values, pct):
+    if not values:
+        return 0.0
+    s = sorted(values)
+    if len(s) == 1:
+        return float(s[0])
+    p = max(0.0, min(100.0, float(pct))) / 100.0
+    i = p * (len(s) - 1)
+    lo = int(math.floor(i))
+    hi = int(math.ceil(i))
+    if lo == hi:
+        return float(s[lo])
+    t = i - lo
+    return float(s[lo] + (s[hi] - s[lo]) * t)
+
+def _effective_color_bins(color_cfg):
+    ps = color_cfg.get("percent_step")
+    if ps is not None:
+        ps = _to_float(ps, None)
+        if ps is not None and ps > 0:
+            return max(2, int(round(100.0 / ps)))
+    return max(2, _to_int(color_cfg.get("color_count", 20), 20))
+
+def _build_color_ratio_fn(snap, color_cfg):
+    vals = [v for v in snap.values() if v > 0]
+    if not vals:
+        return lambda v: 0.0
+
+    mode = color_cfg.get("scale_mode", "adaptive")
+    outlier_mode = color_cfg.get("outlier_mode", "log")
+    cap_pct = color_cfg.get("cap_percentile", 95.0)
+    cap = max(vals)
+
+    if mode in ("adaptive", "stepped"):
+        cap = max(1.0, _percentile(vals, cap_pct))
+    else:
+        cap = max(1.0, float(cap))
+
+    use_log = mode in ("adaptive", "stepped") and outlier_mode == "log"
+    if use_log:
+        base = max(1.0001, _to_float(color_cfg.get("log_base", 10.0), 10.0))
+        denom = math.log(1.0 + cap, base)
+        if denom <= 0:
+            denom = 1.0
+
+        def ratio_fn(v):
+            vv = min(max(0.0, float(v)), cap)
+            return max(0.0, min(1.0, math.log(1.0 + vv, base) / denom))
+
+        return ratio_fn
+
+    def ratio_fn(v):
+        vv = min(max(0.0, float(v)), cap)
+        return max(0.0, min(1.0, vv / cap))
+
+    return ratio_fn
+
+def _parse_semver(version_str):
+    s = str(version_str or "").strip()
+    if s.startswith("v"):
+        s = s[1:]
+    parts = s.split(".")
+    nums = []
+    for p in parts[:3]:
+        token = ""
+        for ch in p:
+            if ch.isdigit():
+                token += ch
+            else:
+                break
+        nums.append(int(token) if token else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums)
+
+def _is_newer_version(current, other):
+    return _parse_semver(current) > _parse_semver(other)
+
+def _windows_process_exe_path(pid):
+    kernel32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None
+    try:
+        buf_len = ctypes.c_ulong(32768)
+        buf = ctypes.create_unicode_buffer(buf_len.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(buf_len)):
+            return None
+        return str(Path(buf.value))
+    finally:
+        kernel32.CloseHandle(handle)
+
+def _list_running_keykey_exe_paths(exe_name):
+    if platform.system() != "Windows":
+        return []
+
+    kernel32 = ctypes.windll.kernel32
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_ulong),
+            ("cntUsage", ctypes.c_ulong),
+            ("th32ProcessID", ctypes.c_ulong),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", ctypes.c_ulong),
+            ("cntThreads", ctypes.c_ulong),
+            ("th32ParentProcessID", ctypes.c_ulong),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_ulong),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == ctypes.c_void_p(-1).value:
+        return []
+
+    current_pid = os.getpid()
+    exe_low = str(exe_name or "").lower()
+    matches = []
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            pid = int(entry.th32ProcessID)
+            pname = str(entry.szExeFile or "").lower()
+            if pid != current_pid and pname == exe_low:
+                pth = _windows_process_exe_path(pid)
+                if pth:
+                    matches.append((pid, pth))
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+
+    return matches
+
+def _query_exe_version(exe_path):
+    if not exe_path:
+        return None
+    try:
+        flags = 0
+        if platform.system() == "Windows":
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        out = subprocess.check_output(
+            [exe_path, "--version"],
+            stderr=subprocess.STDOUT,
+            timeout=4,
+            creationflags=flags,
+            text=True,
+        )
+        v = (out or "").strip().splitlines()
+        return v[0].strip() if v else None
+    except Exception:
+        return None
+
+def _terminate_pid_windows(pid):
+    kernel32 = ctypes.windll.kernel32
+    PROCESS_TERMINATE = 0x0001
+    handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+    if not handle:
+        return False
+    try:
+        return bool(kernel32.TerminateProcess(handle, 0))
+    finally:
+        kernel32.CloseHandle(handle)
+
+def _handle_existing_instance_upgrade():
+    # This behavior targets packaged EXE workflow; avoid matching generic python.exe.
+    if platform.system() != "Windows" or not getattr(sys, "frozen", False):
+        return True
+
+    exe_name = Path(sys.executable).name
+    others = _list_running_keykey_exe_paths(exe_name)
+    if not others:
+        return True
+
+    allow_start = True
+    for pid, exe_path in others:
+        running_ver = _query_exe_version(exe_path)
+        if running_ver is None:
+            allow_start = False
+            continue
+
+        if _is_newer_version(APP_VERSION, running_ver):
+            _terminate_pid_windows(pid)
+            continue
+
+        allow_start = False
+
+    return allow_start
 
 def _foreground_window_title_windows(hwnd):
     user32 = ctypes.windll.user32
@@ -70,10 +504,27 @@ def save_stats(all_counts):
 
 def load_prefs():
     if PREFS_FILE.exists():
-        with open(PREFS_FILE) as f: return json.load(f)
+        with open(PREFS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    if LEGACY_PREFS_FILE.exists():
+        try:
+            with open(LEGACY_PREFS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            save_prefs(data)
+            return data
+        except Exception:
+            pass
     return {}
 def save_prefs(p):
-    with open(PREFS_FILE,"w") as f: json.dump(p,f,indent=2)
+    with open(PREFS_FILE, "w", encoding="utf-8") as f:
+        json.dump(p, f, indent=2)
+
+_RUNTIME_APPS_CFG = dict(DEFAULT_CONFIG["apps"])
+
+def _set_runtime_apps_cfg(apps_cfg):
+    global _RUNTIME_APPS_CFG
+    if isinstance(apps_cfg, dict):
+        _RUNTIME_APPS_CFG = apps_cfg
 
 counts_by_app  = load_stats()
 current_app_id = None
@@ -146,6 +597,8 @@ def _focus_watcher():
     global current_app_id, last_active_app_id
     while True:
         app_id = get_foreground_app_id()
+        if _is_excluded_app(app_id, _RUNTIME_APPS_CFG):
+            app_id = None
         with counts_lock:
             current_app_id = app_id
             if app_id:
@@ -229,6 +682,15 @@ _SPECIAL_TO_ID = {
     "enter":"return",
 }
 
+def _key_category(kid):
+    """Return 'alpha', 'numeral', 'symbols', 'ws', or 'special' for a key_id."""
+    if kid in ("space", "tab"):  return "ws"
+    if len(kid) == 1:
+        if kid.isalpha():  return "alpha"
+        if kid.isdigit():  return "numeral"
+        return "symbols"   # single printable non-alpha non-digit (`, -, =, [, etc.)
+    return "special"       # multi-char = named key (shift, return, ctrl, …)
+
 def normalise_key(key):
     # 1. Try VK code first (most reliable on Windows for symbol keys)
     vk = getattr(key, "vk", None)
@@ -273,7 +735,7 @@ def on_press(key):
 
         # If foreground app cannot be identified by EXE or window title, ignore.
         app_id = current_app_id
-        if not app_id:
+        if not app_id or _is_excluded_app(app_id, _RUNTIME_APPS_CFG):
             return
         app_counts = counts_by_app.setdefault(app_id, Counter())
         app_counts[k] += 1
@@ -297,6 +759,8 @@ def flush_stats_if_dirty():
 listener = pynput_kb.Listener(on_press=on_press, on_release=on_release)
 listener.daemon = True
 listener.start()
+
+_set_runtime_apps_cfg(_load_config()["apps"])
 
 if platform.system() == "Windows":
     focus_thread = threading.Thread(target=_focus_watcher, daemon=True)
@@ -450,9 +914,11 @@ HEAT_STOPS = [
     (0.92,(242,65,18)), (0.96,(238,38,18)), (1.00,(230,20,10)),
 ]
 
-def heat_color(ratio):
+def heat_color(ratio, gamma=0.55, bins=None):
     if ratio <= 0: return "#16192a"
-    ratio = math.pow(max(0.0, min(1.0, ratio)), 0.55)
+    ratio = math.pow(max(0.0, min(1.0, ratio)), max(0.01, float(gamma)))
+    if bins and bins > 1:
+        ratio = round(ratio * (bins - 1)) / (bins - 1)
     for i in range(len(HEAT_STOPS)-1):
         r0,c0 = HEAT_STOPS[i]; r1,c1 = HEAT_STOPS[i+1]
         if r0 <= ratio <= r1:
@@ -510,6 +976,9 @@ class HeatmapWindow:
         self._start_hidden = start_hidden
         self._tray_mode = HAS_TRAY
         self.prefs       = load_prefs()
+        self.config      = _load_config()
+        self.color_cfg   = self.config["color"]
+        self.apps_cfg    = self.config["apps"]
         self.layout_name = detect_layout()
         self.rows        = LAYOUTS[self.layout_name]
 
@@ -532,21 +1001,42 @@ class HeatmapWindow:
         self.root.geometry(f"{w}x{h}+{x}+{y}" if x is not None else f"{w}x{h}")
 
         self.key_cells   = []
-        self.view_var    = tk.StringVar(value="All Apps")
-        self.view_combo  = None
-        self.view_map    = {"All Apps": APP_ALL_ID}
-        self._view_items = ["All Apps"]
-        self._default_view_set = False
+        self.filters_btn = None
+        self._filters_panel_open = False
+        self._filters_panel = None
+        self._filters_checks_frame = None
+        self._filter_group_vars = {}
+        self._filter_app_vars = {}
+        self._filters_structure_sig = None
+        self._main_body = None
+        self._main_left = None
+        self._configured_groups = []
+        self._group_ids = []
+        self._group_to_apps = {}
+        self._app_to_group = {}
+        self._app_labels = {}
+        self._app_ids = []
+        self._group_state = {}
+        self._app_state = {}
+        self._filters_loaded_from_prefs = False
         self._hover_idx  = None
         self._resize_job = None
+        self._geom_save_job = None
         self._stats_expanded = False
         self._stats_frame = None
         self._stats_title = None
         self._bars_indicator_tag = "__bars_indicator__"
         self._bars_snap  = {}
         self._bars_total = 1
+        self._scale_mode_lbl = None
+        self.show_alpha_var   = tk.BooleanVar(value=self.prefs.get("show_alpha",   True))
+        self.show_numeral_var = tk.BooleanVar(value=self.prefs.get("show_numeral", True))
+        self.show_symbols_var = tk.BooleanVar(value=self.prefs.get("show_symbols", True))
+        self.show_special_var = tk.BooleanVar(value=self.prefs.get("show_special", True))
+        self.show_ws_var      = tk.BooleanVar(value=self.prefs.get("show_ws",      True))
 
         self._build_ui()
+        self._sync_filter_options()
         self._refresh()
         self.root.after(2000, self._auto_refresh)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
@@ -582,13 +1072,14 @@ class HeatmapWindow:
 
     def _build_ui(self):
         M = 14
-        self._init_styles()
         hdr = tk.Frame(self.root, bg=BG)
         hdr.pack(fill="x", padx=M, pady=(M,4))
         tk.Label(hdr, text="KEY HEATMAP", font=("Courier New",14,"bold"),
                  fg="#e8f4fd", bg=BG).pack(side="left")
         tk.Label(hdr, text=f"[{self.layout_name.upper()}  auto-detected]",
                  font=("Courier New",9), fg="#374151", bg=BG).pack(side="left", padx=10)
+        self._scale_mode_lbl = tk.Label(hdr, text="", font=("Courier New",9), fg="#4b5563", bg=BG)
+        self._scale_mode_lbl.pack(side="left", padx=8)
         self.total_lbl = tk.Label(hdr, text="", font=("Courier New",10), fg="#6b7280", bg=BG)
         self.total_lbl.pack(side="right")
 
@@ -599,27 +1090,42 @@ class HeatmapWindow:
             return tk.Button(p,text=t,command=cmd,bg="#1a2030",fg=fg,relief="flat",
                              font=("Courier New",9),padx=10,pady=3,cursor="hand2",
                              activebackground=abg,activeforeground=fg,bd=0)
-        tk.Label(bf, text="View", font=("Courier New",9,"bold"), fg="#9ca3af", bg=BG).pack(side="left", padx=(0,8))
-        self.view_combo = ttk.Combobox(
-            bf,
-            textvariable=self.view_var,
-            values=self._view_items,
-            width=34,
-            state="readonly",
-            style="Keykey.TCombobox",
-            font=("Courier New",10),
-        )
-        self.view_combo.pack(side="left", padx=(0,10), ipady=4)
-        self.view_combo.bind("<<ComboboxSelected>>", self._on_view_changed)
+        self.filters_btn = mkbtn(bf, "Filters", self._toggle_filters_panel, "#facc15", "#3f2f00")
+        self.filters_btn.pack(side="left", padx=(0, 10))
 
-        mkbtn(bf,"Refresh",    self._refresh, "#7dd3fc","#1e3a50").pack(side="left",padx=(0,6))
+        mkbtn(bf,"Refresh",    self._on_refresh_clicked, "#7dd3fc","#1e3a50").pack(side="left",padx=(0,6))
         mkbtn(bf,"Reset Stats",self._reset,   "#f87171","#3d1f1f").pack(side="left")
 
-        self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, padx=M, pady=(0,4))
+        key_filters_wrap = tk.Frame(bf, bg=BG)
+        key_filters_wrap.pack(side="right")
+        tk.Label(key_filters_wrap, text="|", font=("Courier New",9), fg="#374151", bg=BG).pack(side="left", padx=(0,6))
+        for _lbl, _var in (
+            ("Alpha",   self.show_alpha_var),
+            ("Numeral", self.show_numeral_var),
+            ("Symbols", self.show_symbols_var),
+            ("Special", self.show_special_var),
+            ("WS",      self.show_ws_var),
+        ):
+            tk.Checkbutton(
+                key_filters_wrap, text=_lbl,
+                variable=_var,
+                command=self._on_filter_changed,
+                bg=BG, fg="#9ca3af", selectcolor="#1a2030",
+                activebackground=BG, activeforeground="#e5e7eb",
+                font=("Courier New", 9),
+            ).pack(side="left", padx=(0, 4))
 
-        self._stats_frame = tk.Frame(self.root, bg=BG, height=self.BARS_H)
-        self._stats_frame.pack(fill="x", padx=M, pady=(0,M))
+        self._main_body = tk.Frame(self.root, bg=BG)
+        self._main_body.pack(fill="both", expand=True, padx=M, pady=(0, M))
+
+        self._main_left = tk.Frame(self._main_body, bg=BG)
+        self._main_left.pack(side="right", fill="both", expand=True)
+
+        self.canvas = tk.Canvas(self._main_left, bg=BG, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, pady=(0,4))
+
+        self._stats_frame = tk.Frame(self._main_left, bg=BG, height=self.BARS_H)
+        self._stats_frame.pack(fill="x")
         self._stats_frame.pack_propagate(False)
         self._stats_title = tk.Label(
             self._stats_frame,
@@ -642,67 +1148,307 @@ class HeatmapWindow:
         self.bars_canvas.bind("<Button-4>", self._on_bars_mousewheel)
         self.bars_canvas.bind("<Button-5>", self._on_bars_mousewheel)
 
-    def _selected_snapshot(self):
-        selected_id = self.view_map.get(self.view_var.get(), APP_ALL_ID)
-        with counts_lock:
-            snap_by_app = {app_id: Counter(c) for app_id, c in counts_by_app.items()}
-            active = current_app_id
+        self._filters_panel = tk.Frame(self._main_body, bg="#111827", width=290, highlightthickness=1, highlightbackground="#223046")
+        self._filters_panel.pack_propagate(False)
 
-        if selected_id == APP_ALL_ID:
-            snap = merge_all_counts(snap_by_app)
-        else:
-            snap = Counter(snap_by_app.get(selected_id, Counter()))
+        panel_title = tk.Label(
+            self._filters_panel,
+            text="APP FILTERS",
+            font=("Courier New", 10, "bold"),
+            fg="#facc15",
+            bg="#111827",
+        )
+        panel_title.pack(anchor="w", padx=10, pady=(10, 6))
 
-        total = sum(snap.values()) or 1
-        return snap, total, selected_id, active
+        panel_hint = tk.Label(
+            self._filters_panel,
+            text="Toggle groups or individual apps",
+            font=("Courier New", 8),
+            fg="#6b7280",
+            bg="#111827",
+        )
+        panel_hint.pack(anchor="w", padx=10, pady=(0, 8))
 
-    def _sync_app_selector(self):
+        self._filters_checks_frame = tk.Frame(self._filters_panel, bg="#111827")
+        self._filters_checks_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def _persist_prefs(self):
+        self.prefs.update({
+            "show_alpha":   self.show_alpha_var.get(),
+            "show_numeral": self.show_numeral_var.get(),
+            "show_symbols": self.show_symbols_var.get(),
+            "show_special": self.show_special_var.get(),
+            "show_ws":      self.show_ws_var.get(),
+            "checked_groups": sorted([gid for gid in self._group_ids if self._group_state.get(gid, True)]),
+            "checked_apps": sorted([app_id for app_id in self._app_ids if self._app_state.get(app_id, True)]),
+        })
+        save_prefs(self.prefs)
+
+    def _reload_config(self):
+        self.config = _load_config()
+        self.color_cfg = self.config["color"]
+        self.apps_cfg = self.config["apps"]
+        _set_runtime_apps_cfg(self.apps_cfg)
+
+    def _collect_app_ids(self):
         with counts_lock:
             app_ids = set(counts_by_app.keys())
             if last_active_app_id:
                 app_ids.add(last_active_app_id)
-            app_ids = sorted(app_ids, key=lambda s: s.lower())
+            if current_app_id:
+                app_ids.add(current_app_id)
+        app_ids = [app_id for app_id in app_ids if not _is_excluded_app(app_id, self.apps_cfg)]
+        return sorted(app_ids, key=lambda s: s.lower())
 
-        labels = make_app_labels(app_ids)
-        new_map = {"All Apps": APP_ALL_ID}
-        for label in sorted(labels.keys(), key=lambda s: s.lower()):
-            new_map[label] = labels[label]
-        new_items = list(new_map.keys())
+    def _sync_filter_options(self, reset=False):
+        app_ids = self._collect_app_ids()
+        labels_by_name = make_app_labels(app_ids)
+        self._app_labels = {app_id: label for label, app_id in labels_by_name.items()}
+        self._app_ids = app_ids
 
-        if new_items == self._view_items:
+        self._configured_groups = _configured_group_ids(self.apps_cfg)
+        self._group_ids = sorted(self._configured_groups + [OTHERS_GROUP_ID], key=lambda g: _group_display_name(g).lower())
+
+        group_to_apps = {gid: [] for gid in self._group_ids}
+        app_to_group = {}
+        for app_id in app_ids:
+            gid = _infer_app_group(app_id, self.apps_cfg) or OTHERS_GROUP_ID
+            if gid not in group_to_apps:
+                group_to_apps[gid] = []
+            group_to_apps[gid].append(app_id)
+            app_to_group[app_id] = gid
+
+        for gid in group_to_apps:
+            group_to_apps[gid].sort(key=lambda app_id: self._app_labels.get(app_id, app_id).lower())
+
+        self._group_to_apps = group_to_apps
+        self._app_to_group = app_to_group
+
+        if not self._filters_loaded_from_prefs:
+            checked_apps = self.prefs.get("checked_apps")
+            checked_groups = self.prefs.get("checked_groups")
+
+            if isinstance(checked_apps, list):
+                checked_app_set = {str(v) for v in checked_apps}
+                for app_id in app_ids:
+                    self._app_state[app_id] = app_id in checked_app_set
+            elif isinstance(checked_groups, list):
+                checked_group_set = set()
+                for value in checked_groups:
+                    raw = str(value).strip().lower()
+                    gid = _normalize_group_id(raw)
+                    if gid:
+                        checked_group_set.add(gid)
+                    elif raw in ("others", "other", OTHERS_GROUP_ID):
+                        checked_group_set.add(OTHERS_GROUP_ID)
+                for app_id in app_ids:
+                    gid = app_to_group.get(app_id, OTHERS_GROUP_ID)
+                    self._app_state[app_id] = gid in checked_group_set
+            else:
+                for app_id in app_ids:
+                    self._app_state[app_id] = True
+
+            self._filters_loaded_from_prefs = True
+        else:
+            existing_state = dict(self._app_state)
+            self._app_state = {}
+            for app_id in app_ids:
+                self._app_state[app_id] = existing_state.get(app_id, True)
+
+        if reset:
+            for app_id in app_ids:
+                self._app_state[app_id] = True
+
+        self._group_state = {}
+        for gid in self._group_ids:
+            apps = self._group_to_apps.get(gid, [])
+            if not apps:
+                self._group_state[gid] = False
+            else:
+                self._group_state[gid] = all(self._app_state.get(app_id, True) for app_id in apps)
+
+        if self._filters_panel_open:
+            sig = self._current_filters_structure_sig()
+            if sig != self._filters_structure_sig:
+                self._rebuild_filters_panel()
+                self._filters_structure_sig = sig
+            else:
+                self._sync_filters_panel_values()
+
+    def _selected_app_ids(self):
+        return [app_id for app_id in self._app_ids if self._app_state.get(app_id, True)]
+
+    def _rebuild_filters_panel(self):
+        if self._filters_checks_frame is None:
             return
 
-        current = self.view_var.get()
-        self.view_map = new_map
-        self._view_items = new_items
-        self.view_combo.configure(values=new_items)
+        for child in self._filters_checks_frame.winfo_children():
+            child.destroy()
 
-        if not self._default_view_set:
-            preferred = None
-            with counts_lock:
-                if last_active_app_id:
-                    preferred = last_active_app_id
-                elif current_app_id:
-                    preferred = current_app_id
+        self._filter_group_vars = {}
+        self._filter_app_vars = {}
 
-            if preferred and preferred in new_map.values():
-                for label, app_id in new_map.items():
-                    if app_id == preferred:
-                        self.view_var.set(label)
-                        break
-            elif current in new_map:
-                self.view_var.set(current)
-            else:
-                self.view_var.set("All Apps")
-            self._default_view_set = True
-        elif current in new_map:
-            self.view_var.set(current)
+        for i, gid in enumerate(self._group_ids):
+            apps = self._group_to_apps.get(gid, [])
+            has_apps = bool(apps)
+            gvar = tk.BooleanVar(value=self._group_state.get(gid, True))
+            self._filter_group_vars[gid] = gvar
+            gchk = tk.Checkbutton(
+                self._filters_checks_frame,
+                text=_group_display_name(gid),
+                variable=gvar,
+                command=lambda g=gid, v=gvar: self._on_group_panel_toggle(g, v),
+                bg="#111827",
+                fg="#9ca3af",
+                selectcolor="#1a2030",
+                activebackground="#111827",
+                activeforeground="#e5e7eb",
+                font=("Courier New", 9, "bold"),
+                anchor="w",
+                padx=4,
+                bd=0,
+                highlightthickness=0,
+                state=("normal" if has_apps else "disabled"),
+                disabledforeground="#4b5563",
+            )
+            gchk.pack(fill="x", pady=(1, 1))
+
+            for app_id in apps:
+                avar = tk.BooleanVar(value=self._app_state.get(app_id, True))
+                self._filter_app_vars[app_id] = avar
+                tk.Checkbutton(
+                    self._filters_checks_frame,
+                    text=f"   {self._app_labels.get(app_id, _display_app_label(app_id))}",
+                    variable=avar,
+                    command=lambda a=app_id, v=avar: self._on_app_panel_toggle(a, v),
+                    bg="#111827",
+                    fg="#9ca3af",
+                    selectcolor="#1a2030",
+                    activebackground="#111827",
+                    activeforeground="#e5e7eb",
+                    font=("Courier New", 9),
+                    anchor="w",
+                    padx=6,
+                    bd=0,
+                    highlightthickness=0,
+                ).pack(fill="x", pady=(0, 0))
+
+            if i < len(self._group_ids) - 1:
+                tk.Frame(self._filters_checks_frame, bg="#223046", height=1).pack(fill="x", pady=(4, 4))
+
+    def _sync_filters_panel_values(self):
+        for gid, gvar in self._filter_group_vars.items():
+            gvar.set(self._group_state.get(gid, True))
+        for app_id, avar in self._filter_app_vars.items():
+            avar.set(self._app_state.get(app_id, True))
+
+    def _toggle_filters_panel(self):
+        if self._filters_panel_open:
+            self._filters_panel.pack_forget()
+            self._filters_panel_open = False
+            return
+
+        self._sync_filter_options()
+        sig = self._current_filters_structure_sig()
+        needs_rebuild = (sig != self._filters_structure_sig) or (not self._filter_group_vars and not self._filter_app_vars)
+        if needs_rebuild:
+            self._rebuild_filters_panel()
+            self._filters_structure_sig = sig
         else:
-            self.view_var.set("All Apps")
+            self._sync_filters_panel_values()
+        self._filters_panel.pack(side="left", fill="y", padx=(0, 10))
+        self._filters_panel_open = True
 
-    def _on_view_changed(self, _=None):
+    def _current_filters_structure_sig(self):
+        return (
+            tuple(self._group_ids),
+            tuple((gid, tuple(self._group_to_apps.get(gid, []))) for gid in self._group_ids),
+            tuple(self._app_labels.get(app_id, "") for app_id in self._app_ids),
+        )
+
+    def _on_group_panel_toggle(self, group_id, var):
+        if not self._group_to_apps.get(group_id):
+            self._group_state[group_id] = False
+            var.set(False)
+            return
+        new_state = bool(var.get())
+        self._group_state[group_id] = new_state
+        for app_id in self._group_to_apps.get(group_id, []):
+            self._app_state[app_id] = new_state
+            app_var = self._filter_app_vars.get(app_id)
+            if app_var is not None:
+                app_var.set(new_state)
+        self._persist_prefs()
         self._hover_idx = None
         self._refresh()
+
+    def _on_app_panel_toggle(self, app_id, var):
+        new_state = bool(var.get())
+        self._app_state[app_id] = new_state
+        gid = self._app_to_group.get(app_id, OTHERS_GROUP_ID)
+        apps = self._group_to_apps.get(gid, [])
+        group_checked = all(self._app_state.get(a, True) for a in apps) if apps else False
+        self._group_state[gid] = group_checked
+        gvar = self._filter_group_vars.get(gid)
+        if gvar is not None:
+            gvar.set(group_checked)
+        self._persist_prefs()
+        self._hover_idx = None
+        self._refresh()
+
+    def _on_refresh_clicked(self):
+        self._reload_config()
+        self.show_alpha_var.set(True)
+        self.show_numeral_var.set(True)
+        self.show_symbols_var.set(True)
+        self.show_special_var.set(True)
+        self.show_ws_var.set(True)
+        self._sync_filter_options(reset=True)
+        self._persist_prefs()
+        self._hover_idx = None
+        self._draw_keys()
+        self._refresh()
+
+    def _on_filter_changed(self):
+        self._persist_prefs()
+        self._refresh()
+
+    def _scale_mode_text(self):
+        mode = self.color_cfg.get("scale_mode", "adaptive")
+        if mode == "stepped":
+            bins = _effective_color_bins(self.color_cfg)
+            ps = self.color_cfg.get("percent_step")
+            if ps is not None:
+                return f"[stepped {ps:g}% -> {bins} bins]"
+            return f"[stepped {bins} bins]"
+        if mode == "adaptive":
+            return "[adaptive scale]"
+        return "[smooth scale]"
+
+    def _filtered_snap(self, snap):
+        show = {
+            "alpha":   self.show_alpha_var.get(),
+            "numeral": self.show_numeral_var.get(),
+            "symbols": self.show_symbols_var.get(),
+            "special": self.show_special_var.get(),
+            "ws":      self.show_ws_var.get(),
+        }
+        if all(show.values()):
+            return snap
+        return Counter({k: v for k, v in snap.items() if show[_key_category(k)]})
+
+    def _selected_snapshot(self):
+        selected_ids = self._selected_app_ids()
+        with counts_lock:
+            snap_by_app = {app_id: Counter(c) for app_id, c in counts_by_app.items()}
+            active = current_app_id
+
+        snap = Counter()
+        for app_id in selected_ids:
+            snap.update(snap_by_app.get(app_id, Counter()))
+
+        total = sum(snap.values()) or 1
+        return snap, total, selected_ids, active
 
     def _draw_keys(self):
         cw = self.canvas.winfo_width()
@@ -710,8 +1456,17 @@ class HeatmapWindow:
         if cw < 20 or ch < 20: return
 
         pad   = max(2, int(cw * PAD_RATIO))
-        unit  = (cw - pad*(TOTAL_UNITS+1)) / TOTAL_UNITS
-        key_h = (ch - pad*(NUM_ROWS+1)) / NUM_ROWS
+        key_ratio = 1.0  # Keep key aspect consistent while scaling up/down.
+        unit_w = (cw - pad * (TOTAL_UNITS + 1)) / TOTAL_UNITS
+        unit_h = (ch - pad * (NUM_ROWS + 1)) / (NUM_ROWS * key_ratio)
+        unit = max(1.0, min(unit_w, unit_h))
+        key_h = unit * key_ratio
+
+        kb_w = pad * (TOTAL_UNITS + 1) + TOTAL_UNITS * unit
+        kb_h = pad * (NUM_ROWS + 1) + NUM_ROWS * key_h
+        left = max(0, (cw - kb_w) / 2)
+        top = max(0, (ch - kb_h) / 2)
+
         fs    = max(6, min(13, int(unit*0.28)))
         fs_s  = max(5, fs-2)
 
@@ -719,7 +1474,10 @@ class HeatmapWindow:
         self.key_cells.clear()
 
         snap, _, _, _ = self._selected_snapshot()
-        max_v = max(snap.values(), default=1)
+        snap = self._filtered_snap(snap)
+        ratio_fn = _build_color_ratio_fn(snap, self.color_cfg)
+        gamma = self.color_cfg.get("gamma", 0.55)
+        bins = _effective_color_bins(self.color_cfg) if self.color_cfg.get("scale_mode") == "stepped" else None
 
         def on_enter(idx):
             self._hover_idx = idx
@@ -729,14 +1487,14 @@ class HeatmapWindow:
             self._hide_pct(idx)
 
         for row_i, row in enumerate(self.rows):
-            x = pad
-            y = pad + row_i*(key_h+pad)
+            x = left + pad
+            y = top + pad + row_i*(key_h+pad)
             for tup in row:
                 n, s, kid, width = tup
                 w     = width*unit + (width-1)*pad
                 v     = snap.get(kid, 0)
-                ratio = v / max_v
-                bg    = heat_color(ratio)
+                ratio = ratio_fn(v)
+                bg    = heat_color(ratio, gamma=gamma, bins=bins)
                 fg    = text_color(bg)
                 ol    = BG if ratio > 0.05 else OUTLINE
 
@@ -774,6 +1532,9 @@ class HeatmapWindow:
     def _on_root_configure(self, event):
         if event.widget is not self.root:
             return
+        if self._geom_save_job:
+            self.root.after_cancel(self._geom_save_job)
+        self._geom_save_job = self.root.after(250, self._save_geometry)
         if self._stats_expanded:
             self._layout_stats_panel()
 
@@ -842,14 +1603,18 @@ class HeatmapWindow:
             )
 
     def _refresh(self):
-        self._sync_app_selector()
-        snap, total, selected_id, active = self._selected_snapshot()
-        max_v = max(snap.values(), default=1)
+        self._sync_filter_options()
+        snap, total, selected_ids, active = self._selected_snapshot()
+        snap = self._filtered_snap(snap)
+        total = sum(snap.values()) or 1
+        ratio_fn = _build_color_ratio_fn(snap, self.color_cfg)
+        gamma = self.color_cfg.get("gamma", 0.55)
+        bins = _effective_color_bins(self.color_cfg) if self.color_cfg.get("scale_mode") == "stepped" else None
 
         for cell in self.key_cells:
             v     = snap.get(cell["kid"],0)
-            ratio = v/max_v
-            bg    = heat_color(ratio)
+            ratio = ratio_fn(v)
+            bg    = heat_color(ratio, gamma=gamma, bins=bins)
             fg    = text_color(bg)
             ol    = BG if ratio>0.05 else OUTLINE
             self.canvas.itemconfig(cell["rect"],fill=bg,outline=ol)
@@ -859,15 +1624,17 @@ class HeatmapWindow:
         if self._hover_idx is not None and 0 <= self._hover_idx < len(self.key_cells):
             self._show_pct(self._hover_idx)
 
-        if selected_id == APP_ALL_ID:
+        if not self._app_ids or len(selected_ids) >= len(self._app_ids):
             scope = "all apps"
         else:
-            scope = self.view_var.get()
+            scope = f"{len(selected_ids)} apps"
         active_label = ""
         if active:
             active_name = _display_app_label(active)
             active_label = f"  |  active: {active_name}"
         self.total_lbl.config(text=f"{total:,} keystrokes  |  {scope}{active_label}")
+        if self._scale_mode_lbl is not None:
+            self._scale_mode_lbl.config(text=self._scale_mode_text())
         self._update_bars(snap,total)
 
     def _update_bars(self,snap,total):
@@ -890,6 +1657,9 @@ class HeatmapWindow:
             rows = rows[:10]
 
         max_v  = rows[0][1]
+        ratio_fn = _build_color_ratio_fn(dict(rows), self.color_cfg)
+        gamma = self.color_cfg.get("gamma", 0.55)
+        bins = _effective_color_bins(self.color_cfg) if self.color_cfg.get("scale_mode") == "stepped" else None
         row_h  = 14
         lbl_w  = 90
         num_w  = 120
@@ -897,12 +1667,14 @@ class HeatmapWindow:
         bar_w  = max(10, cw-lbl_w-num_w-18)
         for i,(k,v) in enumerate(rows):
             y=i*(row_h+3)+2; cy=y+row_h/2
-            ratio=v/max_v; pct=100*v/total
+            ratio_raw=v/max_v
+            ratio_col=ratio_fn(v)
+            pct=100*v/total
             bc.create_text(lbl_w-4,cy,text=repr(k) if len(k)==1 else k,
                            anchor="e",font=("Courier New",8),fill="#94a3b8")
             bc.create_rectangle(bar_x0,y,bar_x0+bar_w,y+row_h,fill="#1a2030",outline="")
-            bc.create_rectangle(bar_x0,y,bar_x0+max(2,int(bar_w*ratio)),y+row_h,
-                                fill=heat_color(ratio),outline="")
+            bc.create_rectangle(bar_x0,y,bar_x0+max(2,int(bar_w*ratio_raw)),y+row_h,
+                                fill=heat_color(ratio_col, gamma=gamma, bins=bins),outline="")
             bc.create_text(bar_x0+bar_w+6,cy,text=f"{v:,}  ({pct:.1f}%)",
                            anchor="w",font=("Courier New",8),fill="#64748b")
         content_h = len(rows) * (row_h + 3) + 6
@@ -918,7 +1690,9 @@ class HeatmapWindow:
         if not (0 <= idx < len(self.key_cells)):
             return
         cell = self.key_cells[idx]
-        snap, total, _, _ = self._selected_snapshot()
+        snap, _, _, _ = self._selected_snapshot()
+        snap = self._filtered_snap(snap)
+        total = sum(snap.values()) or 1
         pct = (100.0 * snap.get(cell["kid"], 0)) / total
         txt = f"{pct:.1f}%"
         if len(cell["texts"]) == 1:
@@ -942,10 +1716,12 @@ class HeatmapWindow:
     def _reset(self):
         global stats_dirty
         import tkinter.messagebox
-        selected_label = self.view_var.get()
-        selected_id = self.view_map.get(selected_label, APP_ALL_ID)
 
-        if selected_id == APP_ALL_ID:
+        selected_ids = self._selected_app_ids()
+        if self._app_ids and not selected_ids:
+            tkinter.messagebox.showinfo("Reset", "No apps are currently selected in Filters.")
+            return
+        if not self._app_ids or len(selected_ids) >= len(self._app_ids):
             ok = tkinter.messagebox.askyesno("Reset", "Clear ALL keystroke data for all apps?")
             if not ok:
                 return
@@ -953,19 +1729,21 @@ class HeatmapWindow:
                 counts_by_app.clear()
                 stats_dirty = True
         else:
-            ok = tkinter.messagebox.askyesno("Reset", f"Clear keystroke data for '{selected_label}'?")
+            ok = tkinter.messagebox.askyesno("Reset", f"Clear keystroke data for {len(selected_ids)} selected app(s)?")
             if not ok:
                 return
             with counts_lock:
-                counts_by_app.pop(selected_id, None)
+                for app_id in selected_ids:
+                    counts_by_app.pop(app_id, None)
                 stats_dirty = True
 
         flush_stats_if_dirty()
-        self._sync_app_selector()
+        self._sync_filter_options()
         self._draw_keys()
         self._refresh()
 
     def _save_geometry(self):
+        self._geom_save_job = None
         self.prefs.update({"w":self.root.winfo_width(),"h":self.root.winfo_height(),
                            "x":self.root.winfo_x(),"y":self.root.winfo_y()})
         save_prefs(self.prefs)
@@ -979,7 +1757,12 @@ class HeatmapWindow:
             self.root.destroy()
 
     def show(self):
-        self._refresh(); self.root.deiconify(); self.root.lift(); self.root.focus_force()
+        self._reload_config()
+        self._sync_filter_options()
+        self._refresh()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
     def hide(self):
         self._save_geometry(); self.root.withdraw()
     def run(self):
@@ -1241,14 +2024,30 @@ def run_with_tray(win):
 if __name__ == "__main__":
     import tkinter.messagebox
 
+    argv = [str(a).strip().lower() for a in sys.argv[1:]]
+    if "--version" in argv or "-v" in argv:
+        print(APP_VERSION)
+        sys.exit(0)
+
+    if not _handle_existing_instance_upgrade():
+        # Existing instance is same/newer, or its version could not be queried safely.
+        sys.exit(0)
+
     if not HAS_TRAY and TRAY_IMPORT_ERROR:
         print(f"Tray support disabled: {TRAY_IMPORT_ERROR}")
 
     win = HeatmapWindow(start_hidden=HAS_TRAY)
-    if HAS_TRAY:
-        run_with_tray(win)
-    else:
-        win.run()
+    try:
+        if HAS_TRAY:
+            run_with_tray(win)
+        else:
+            win.run()
+    except KeyboardInterrupt:
+        flush_stats_if_dirty()
+        try:
+            win.root.destroy()
+        except Exception:
+            pass
 
 
 

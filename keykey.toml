@@ -1,0 +1,48 @@
+# Keykey shared configuration
+# This file controls rendering/app-group behavior only.
+# Raw key counts in stats.json are never transformed.
+
+[color]
+# adaptive | smooth | stepped
+# adaptive: log + optional percentile cap (best default for outliers)
+# smooth: linear scale using raw max
+# stepped: adaptive normalization + quantized color bins
+scale_mode = "smooth"
+
+# If set (>0), this takes priority over color_count.
+# Example: 5.0 means one color bin per 5 percent -> ~20 bins.
+percent_step = 5.0
+
+# Fallback bin count when percent_step is not set.
+color_count = 20
+
+# Gamma curve for palette interpolation. Lower boosts low values more.
+gamma = 0.8
+
+# log | none
+outlier_mode = "log"
+
+# Base for logarithmic normalization (only used with outlier_mode=log)
+log_base = 10.0
+
+# Percentile cap used by adaptive/stepped to reduce extreme outlier dominance.
+cap_percentile = 95.0
+
+[apps]
+# Any entry here excludes matching apps from tracking and UI.
+# Matching is case-insensitive against exe/path/label and window title.
+exclude = ["ScreenClippingHost", "SearchApp", "ClippingTool", "SnippingTool", "Keykey", "Taskmgr"]
+
+[apps.groups]
+# Match rules by executable stem/name/label/path substring.
+game = []
+coding = []
+office = []
+creative = []
+
+[apps.title_contains]
+# Additional title substring rules, useful for apps without stable exe paths.
+game = ["dota", "counter-strike"]
+coding = ["code", "pycharm", "cursor"]
+office = ["excel", "word", "powerpoint", "outlook"]
+creative = ["photoshop", "illustrator", "blender", "premiere", "kicad", "gimp", "inkscape"]
